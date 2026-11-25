@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hf-int4-g16-xpu"
+version = "0.1.0"
+description = "vLLM XPU out-of-tree plugin for Had128NoPerm HF-INT4-G16"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+hf_int4_g16_xpu = "hf_int4_g16_xpu.vllm_plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["hf_int4_g16_xpu*"]
+
+[tool.setuptools.package-data]
+hf_int4_g16_xpu = ["native/*", "_l0_native.cpp"]

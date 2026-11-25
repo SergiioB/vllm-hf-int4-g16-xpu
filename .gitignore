@@ -1,0 +1,21 @@
+# Python and build output
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+
+# Caches
+.pytest_cache/
+.hypothesis/
+.torch_ext_build/
+.hf_cache/
+.tmp/
+
+# Local experiment material. It records host paths and device IDs.
+testdata/
+probe/
+reference/
+results/
+
+# Copy of hf_int4_g16_xpu/native/ that build_kernels.sh keeps in sync when present.
+/native/
