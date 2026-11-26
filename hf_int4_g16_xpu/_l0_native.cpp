@@ -13,6 +13,7 @@
 #include <sycl/sycl.hpp>
 #include <level_zero/ze_api.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -21,6 +22,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -134,6 +136,7 @@ std::string sha256_hex(const std::vector<char>& bytes) {
 const std::vector<std::pair<const char*, uint32_t>>& required_kernel_abis() {
   static const std::vector<std::pair<const char*, uint32_t>> specs = {
       {"fused_fwht128_actq", 5},
+      {"fused_fwht64_actq", 5},
       {"hf_dpas_m8_sk4", 12},
       {"hf_dpas_m16_sk4", 12},
       {"hf_dpas_m32_sk4", 12},
@@ -143,6 +146,23 @@ const std::vector<std::pair<const char*, uint32_t>>& required_kernel_abis() {
       {"hf_decode_fused_m1", 9},
       {"hf_decode_fused_m2", 9},
       {"hf_decode_fused_m4", 9},
+      {"hf_decode_fused_had64_m1", 9},
+      {"hf_decode_fused_had64_m2", 9},
+      {"hf_decode_fused_had64_m4", 9},
+      {"hf_moe_pair_had128_bf16", 12},
+      {"hf_moe_pair_had128_f32", 12},
+      {"hf_moe_pair_had64_bf16", 12},
+      {"hf_moe_pair_had64_f32", 12},
+      {"hf_moe_bucket_zero", 2},
+      {"hf_moe_bucket_count", 4},
+      {"hf_moe_bucket_scan", 5},
+      {"hf_moe_bucket_scatter", 5},
+      {"hf_moe_rotate_had128", 4},
+      {"hf_moe_rotate_had64", 4},
+      {"hf_moe_tile_had128_bf16", 13},
+      {"hf_moe_tile_had128_f32", 13},
+      {"hf_moe_tile_had64_bf16", 13},
+      {"hf_moe_tile_had64_f32", 13},
   };
   return specs;
 }
@@ -270,6 +290,36 @@ void check_aligned(const char* name, const void* p) {
   TORCH_CHECK(aligned16(p), name, " base pointer is not 16-byte aligned");
 }
 
+// Mirrors native_l0.block2d_surface_error: cl_intel_subgroup_2d_block_io 6.13.X.6.
+constexpr int64_t kBlock2dMaxExtent = int64_t(1) << 24;
+constexpr int64_t kInt32Max = 2147483647;
+// Token rows per grouped MoE tile (native_l0.MOE_TILE_ROWS).
+constexpr int64_t kMoeTileRows = 16;
+
+void check_int32(const char* name, int64_t value) {
+  TORCH_CHECK(value >= 0 && value <= kInt32Max, name, "=", value, " does not fit an int32 kernel argument");
+}
+
+void check_block2d_surface(const char* name, const void* base, int64_t width, int64_t height, int64_t pitch) {
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(base) % 64 == 0, name,
+              " effective base address is not 64-byte aligned");
+  TORCH_CHECK(width >= 64 && width <= kBlock2dMaxExtent && width % 4 == 0, name,
+              " 2D block-io surface width ", width, " B must be in [64, 2^24] and a multiple of 4");
+  TORCH_CHECK(height > 0 && height <= kBlock2dMaxExtent, name,
+              " 2D block-io surface height ", height, " must be in [1, 2^24]");
+  TORCH_CHECK(pitch >= width && pitch % 16 == 0 && pitch <= kBlock2dMaxExtent, name,
+              " 2D block-io pitch ", pitch, " B must be >= width, a multiple of 16 and <= 2^24");
+}
+
+// The kernels read 16 output columns per sub-group, so N%16==0 keeps every
+// tile inside the surface.  `rows` is K/8.
+void check_packed_weight_surface(const void* base, int64_t rows, int64_t n) {
+  TORCH_CHECK(n >= 16 && n % 16 == 0,
+              "native requires N>=16 and N%16==0 (surface width 4N a multiple of 64 B), got N ", n);
+  TORCH_CHECK(n <= kBlock2dMaxExtent / 4, "q_pack surface width 4N exceeds 2^24 B for N ", n);
+  check_block2d_surface("q_pack", base, 4 * n, rows, 4 * n);
+}
+
 void check_same_device(const torch::Tensor& ref, const torch::Tensor& other, const char* name) {
   TORCH_CHECK(other.device() == ref.device(), name, " is on ", other.device(),
               " but input is on ", ref.device(), "; all native operands must share one XPU device");
@@ -299,8 +349,8 @@ void check_common(const torch::Tensor& q, const torch::Tensor& u, const torch::T
   TORCH_CHECK(d.dim() == 1, "d_row must be rank-1");
   TORCH_CHECK(q.size(0) * 8 == u.size(0) * 64, "q/u K mismatch");
   TORCH_CHECK(q.size(1) == u.size(1) && q.size(1) == d.numel(), "q/u/D N mismatch");
-  TORCH_CHECK(q.size(1) % 8 == 0, "native requires N%8==0 for aligned 2D block-io rows, got N ", q.size(1));
   TORCH_CHECK(q.size(0) * 8 <= 17408, "K exceeds INT32-accumulation bound 17408");
+  check_packed_weight_surface(q.data_ptr(), q.size(0), q.size(1));
   check_aligned("q_pack", q.data_ptr());
   check_aligned("u_pack", u.data_ptr());
   check_aligned("d_row", d.data_ptr());
@@ -316,6 +366,12 @@ const float* optional_bias_ptr(const std::optional<torch::Tensor>& bias, int64_t
   TORCH_CHECK(bias->numel() == n, "bias_corr length ", bias->numel(), " != N ", n);
   check_aligned("bias_corr", bias->data_ptr());
   return reinterpret_cast<const float*>(bias->data_ptr());
+}
+
+// The Hadamard block is a pure function of the global K (format.had_block_for_k).
+int had_block_of(int64_t k) {
+  TORCH_CHECK(k > 0 && k % 64 == 0, "K must be a multiple of 128 (Had128) or 64 (Had64), got ", k);
+  return k % 128 == 0 ? 128 : 64;
 }
 
 void launch_decode_piece(const sycl::kernel& k, sycl::queue& q,
@@ -356,8 +412,10 @@ void fwht_actq(torch::Tensor x, torch::Tensor signs, torch::Tensor xi8, torch::T
   check_same_device(x, signs, "signs");
   check_same_device(x, xi8, "xi8");
   check_same_device(x, sx, "sx");
+  check_int32("M", x.size(0));
+  check_int32("K", x.size(1));
   int M = (int)x.size(0), K = (int)x.size(1);
-  TORCH_CHECK(K % 128 == 0 && K <= 17408, "native fwht_actq requires K%128==0 and K<=17408");
+  TORCH_CHECK(K % 64 == 0 && K <= 17408, "native fwht_actq requires K%64==0 and K<=17408");
   TORCH_CHECK(signs.numel() == K, "signs length ", signs.numel(), " != K ", K);
   TORCH_CHECK(xi8.numel() == x.numel(), "xi8 output numel mismatch");
   TORCH_CHECK(sx.numel() == M, "sx length ", sx.numel(), " != M ", M);
@@ -370,7 +428,8 @@ void fwht_actq(torch::Tensor x, torch::Tensor signs, torch::Tensor xi8, torch::T
   record_input_stream(signs, device_index);
   record_input_stream(xi8, device_index);
   record_input_stream(sx, device_index);
-  const auto& k = kernel_obj(st, q.get_context(), "fused_fwht128_actq", 5);
+  const auto& k = kernel_obj(st, q.get_context(),
+                             had_block_of(K) == 128 ? "fused_fwht128_actq" : "fused_fwht64_actq", 5);
   const void* xp = x.data_ptr();
   const void* sp = signs.data_ptr();
   const void* xi = xi8.data_ptr();
@@ -398,9 +457,12 @@ torch::Tensor dpas_w4a8(torch::Tensor xi8, torch::Tensor sx, torch::Tensor q, to
   TORCH_CHECK(sx.dim() == 1 && sx.is_xpu() && sx.scalar_type() == at::kFloat && sx.is_contiguous());
   check_same_device(xi8, q, "q_pack");
   check_same_device(xi8, sx, "sx");
+  check_int32("M", xi8.size(0));
+  check_int32("K", xi8.size(1));
+  check_int32("N", q.size(1));
   int M = (int)xi8.size(0), K = (int)xi8.size(1), N = (int)q.size(1);
   TORCH_CHECK(K == q.size(0) * 8, "xi8/q K mismatch");
-  TORCH_CHECK(K % 128 == 0 && K <= 17408, "native dpas requires K%128==0 and K<=17408");
+  TORCH_CHECK(K % 64 == 0 && K <= 17408, "native dpas requires K%64==0 and K<=17408");
   TORCH_CHECK(sx.numel() == M, "sx length ", sx.numel(), " != M ", M);
   check_aligned("xi8", xi8.data_ptr());
   check_aligned("sx", sx.data_ptr());
@@ -414,6 +476,8 @@ torch::Tensor dpas_w4a8(torch::Tensor xi8, torch::Tensor sx, torch::Tensor q, to
   if (M == 0) {
     return write_i32 ? ci32 : out;
   }
+  check_block2d_surface("int8 activation", xi8.data_ptr(), K, M, K);
+  check_block2d_surface("bf16 output", out.data_ptr(), int64_t(2) * N, M, int64_t(2) * N);
 
   std::string name; int sg_m, wg_n;
   bool small_sk4 = M <= 32;
@@ -465,6 +529,8 @@ torch::Tensor dpas_w4a8(torch::Tensor xi8, torch::Tensor sx, torch::Tensor q, to
 torch::Tensor fwht_dpas_w4a8(torch::Tensor x, torch::Tensor signs, torch::Tensor q, torch::Tensor u,
                              torch::Tensor d, std::optional<torch::Tensor> bias, const std::string& binpath) {
   TORCH_CHECK(x.dim() == 2, "native fwht_dpas input must be rank-2");
+  check_int32("M", x.size(0));
+  check_int32("K", x.size(1));
   int M = (int)x.size(0), K = (int)x.size(1);
   const c10::DeviceGuard guard(x.device());
   auto xi8 = torch::empty({M, K}, x.options().dtype(at::kChar));
@@ -487,10 +553,13 @@ torch::Tensor decode_fused(torch::Tensor x, torch::Tensor signs, torch::Tensor q
               "signs must be contiguous rank-1 int8 XPU");
   check_same_device(x, q, "q_pack");
   check_same_device(x, signs, "signs");
+  check_int32("M", x.size(0));
+  check_int32("K", x.size(1));
+  check_int32("N", q.size(1));
   int M = (int)x.size(0), K = (int)x.size(1), N = (int)q.size(1);
   TORCH_CHECK(M >= 1 && M <= 4, "native fused decode supports M in {1,2,3,4}");
   TORCH_CHECK(K == q.size(0) * 8, "x/q K mismatch");
-  TORCH_CHECK(K % 128 == 0 && K <= 17408, "native decode requires K%128==0 and K<=17408");
+  TORCH_CHECK(K % 64 == 0 && K <= 17408, "native decode requires K%64==0 and K<=17408");
   TORCH_CHECK(signs.numel() == K, "signs length ", signs.numel(), " != K ", K);
   check_aligned("x", x.data_ptr());
   check_aligned("signs", signs.data_ptr());
@@ -509,20 +578,311 @@ torch::Tensor decode_fused(torch::Tensor x, torch::Tensor signs, torch::Tensor q
   record_input_stream(d, device_index);
   record_optional_stream(bias, device_index);
 
+  const std::string stem = had_block_of(K) == 128 ? "hf_decode_fused_m" : "hf_decode_fused_had64_m";
   if (M == 3) {
     // Never launch the fixed four-row kernel on a three-row allocation.  Two
     // ordered pieces keep both scratch/output bounds exact and are graph-recordable.
-    const auto& k2 = kernel_obj(st, que.get_context(), "hf_decode_fused_m2", 9);
-    const auto& k1 = kernel_obj(st, que.get_context(), "hf_decode_fused_m1", 9);
+    const auto& k2 = kernel_obj(st, que.get_context(), stem + "2", 9);
+    const auto& k1 = kernel_obj(st, que.get_context(), stem + "1", 9);
     launch_decode_piece(k2, que, xp, sp, qp, up, dp, biasp, op, N, K);
     launch_decode_piece(k1, que, xp + (size_t)2 * K * 2, sp, qp, up, dp, biasp,
                         op + (size_t)2 * N * 2, N, K);
     return out;
   }
 
-  std::string name = M == 1 ? "hf_decode_fused_m1" : (M == 2 ? "hf_decode_fused_m2" : "hf_decode_fused_m4");
-  const auto& k = kernel_obj(st, que.get_context(), name, 9);
+  const auto& k = kernel_obj(st, que.get_context(), stem + std::to_string(M), 9);
   launch_decode_piece(k, que, xp, sp, qp, up, dp, biasp, op, N, K);
+  return out;
+}
+
+// Grouped routed-expert W4A16: one output row per (token, slot) pair.  Pair p
+// reads x row p / in_div and the packed weights of expert ids[p].  Routing is
+// read on the device: the launch shape depends only on (pairs, N).
+torch::Tensor moe_pair(torch::Tensor x, torch::Tensor signs, torch::Tensor q, torch::Tensor u, torch::Tensor d,
+                       std::optional<torch::Tensor> bias, torch::Tensor ids, int64_t in_div, bool out_f32,
+                       const std::string& binpath) {
+  const c10::DeviceGuard guard(x.device());
+  const int device_index = x.get_device();
+  auto& st = state_for(device_index, binpath);
+  sycl::queue& que = current_queue(device_index);
+  TORCH_CHECK(x.dim() == 2 && x.is_xpu() && x.scalar_type() == at::kBFloat16 && x.is_contiguous(),
+              "native moe_pair requires a contiguous rank-2 bf16 XPU input");
+  TORCH_CHECK(signs.dim() == 1 && signs.is_xpu() && signs.scalar_type() == at::kChar && signs.is_contiguous(),
+              "signs must be contiguous rank-1 int8 XPU");
+  TORCH_CHECK(q.dim() == 3 && u.dim() == 3 && d.dim() == 2, "moe q/u/d must be rank 3/3/2");
+  TORCH_CHECK(q.is_xpu() && u.is_xpu() && d.is_xpu(), "packed tensors must be XPU tensors");
+  TORCH_CHECK(q.is_contiguous() && u.is_contiguous() && d.is_contiguous(), "packed tensors must be contiguous");
+  TORCH_CHECK(q.scalar_type() == at::kInt && u.scalar_type() == at::kShort && d.scalar_type() == at::kFloat,
+              "moe packed dtypes must be int32/int16/fp32");
+  TORCH_CHECK(ids.dim() == 1 && ids.is_xpu() && ids.scalar_type() == at::kInt && ids.is_contiguous(),
+              "expert ids must be a contiguous rank-1 int32 XPU tensor");
+  check_same_device(x, signs, "signs");
+  check_same_device(x, q, "q_pack");
+  check_same_device(x, u, "u_pack");
+  check_same_device(x, d, "d_row");
+  check_same_device(x, ids, "expert_ids");
+  const int64_t K = x.size(1), E = d.size(0), N = d.size(1), P = ids.size(0);
+  const int block = had_block_of(K);
+  TORCH_CHECK(signs.numel() == K, "signs length ", signs.numel(), " != K ", K);
+  TORCH_CHECK(E > 0, "empty expert table (E == 0)");
+  TORCH_CHECK(q.size(0) == E && q.size(1) == K / 8 && q.size(2) == N, "moe q_pack shape mismatch");
+  TORCH_CHECK(u.size(0) == E && u.size(1) == K / 64 && u.size(2) == N, "moe u_pack shape mismatch");
+  TORCH_CHECK(in_div > 0 && P == x.size(0) * in_div, "pairs ", P, " != rows ", x.size(0), " * in_div ", in_div);
+  check_int32("N", N);
+  check_int32("K", K);
+  check_int32("E", E);
+  check_int32("in_div", in_div);
+  check_int32("pairs", P);
+  check_packed_weight_surface(q.data_ptr(), K / 8, N);
+  TORCH_CHECK((K / 8) * N * 4 % 64 == 0, "per-expert q_pack stride is not a multiple of 64 B");
+  check_aligned("x", x.data_ptr());
+  check_aligned("signs", signs.data_ptr());
+  check_aligned("q_pack", q.data_ptr());
+  check_aligned("u_pack", u.data_ptr());
+  check_aligned("d_row", d.data_ptr());
+  check_aligned("expert_ids", ids.data_ptr());
+  const float* biasp = nullptr;
+  if (bias.has_value() && bias->defined()) {
+    TORCH_CHECK(bias->is_xpu() && bias->scalar_type() == at::kFloat && bias->is_contiguous() &&
+                    bias->dim() == 2 && bias->size(0) == E && bias->size(1) == N,
+                "moe bias_corr must be a contiguous fp32 XPU tensor [E,N]");
+    TORCH_CHECK(bias->device() == x.device(), "bias_corr must be on the same XPU device as the input");
+    check_aligned("bias_corr", bias->data_ptr());
+    biasp = reinterpret_cast<const float*>(bias->data_ptr());
+  }
+  auto out = torch::empty({P, N}, x.options().dtype(out_f32 ? at::kFloat : at::kBFloat16));
+  if (P == 0) return out;
+  const std::string name = std::string("hf_moe_pair_had") + std::to_string(block) + (out_f32 ? "_f32" : "_bf16");
+  const auto& k = kernel_obj(st, que.get_context(), name, 12);
+  record_input_stream(x, device_index);
+  record_input_stream(signs, device_index);
+  record_input_stream(q, device_index);
+  record_input_stream(u, device_index);
+  record_input_stream(d, device_index);
+  record_input_stream(ids, device_index);
+  record_optional_stream(bias, device_index);
+  const void* xp = x.data_ptr();
+  const void* sp = signs.data_ptr();
+  const void* qp = q.data_ptr();
+  const void* up = u.data_ptr();
+  const void* dp = d.data_ptr();
+  const void* ip = ids.data_ptr();
+  const void* op = out.data_ptr();
+  const int n32 = (int)N, k32 = (int)K, e32 = (int)E, div32 = (int)in_div;
+  const uint32_t gx = (uint32_t)((N + 31) / 32), gy = (uint32_t)P;
+  que.submit([&](sycl::handler& h) {
+    set_ptr_arg(h, 0, xp);
+    set_ptr_arg(h, 1, sp);
+    set_ptr_arg(h, 2, qp);
+    set_ptr_arg(h, 3, up);
+    set_ptr_arg(h, 4, dp);
+    set_ptr_arg(h, 5, biasp);
+    set_ptr_arg(h, 6, ip);
+    set_ptr_arg(h, 7, op);
+    h.set_arg(8, n32); h.set_arg(9, k32); h.set_arg(10, e32); h.set_arg(11, div32);
+    h.parallel_for(nd_from_opencl_groups(gx, gy, 1, 128, 1, 1), k);
+  });
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Grouped-by-expert prefill.  All routing work happens on the device, in
+// launches whose shapes depend only on (pairs, E, N, K), so a captured graph
+// follows new routes on replay.  Scratch is allocated per call on the current
+// stream (and from the capture pool while a graph records).
+// ---------------------------------------------------------------------------
+template <typename SetArgs>
+void submit_nd(sycl::queue& que, const sycl::kernel& k, size_t gx, size_t gy, size_t lx, SetArgs&& set_args) {
+  que.submit([&](sycl::handler& h) {
+    set_args(h);
+    h.parallel_for(nd_from_opencl_groups((uint32_t)gx, (uint32_t)gy, 1, (uint32_t)lx, 1, 1), k);
+  });
+}
+
+int64_t moe_max_tiles(int64_t pairs, int64_t buckets) {
+  // sum over buckets of ceil(count / rows) <= pairs / rows + (non-empty buckets)
+  return std::min(pairs, pairs / kMoeTileRows + std::min(buckets, pairs));
+}
+
+// The tile kernel uses the bucket buffers as activation, expert and output
+// addresses and does not bounds-check them.  They are therefore only reachable
+// through this capsule: Python can neither read, build nor replace them, and
+// moe_tile accepts them only for the (pairs, E, device) they were built for.
+struct GroupedBuckets {
+  torch::Tensor perm, tiles, ntiles;
+  int64_t pairs, num_experts;
+  int device_index;
+};
+
+constexpr const char* kBucketsName = "hf_int4_g16.GroupedBucketDescriptor";
+
+const GroupedBuckets& grouped_buckets(const pybind11::capsule& capsule) {
+  TORCH_CHECK(PyCapsule_IsValid(capsule.ptr(), kBucketsName),
+              "buckets must be the GroupedBucketDescriptor returned by moe_bucket");
+  return *static_cast<const GroupedBuckets*>(PyCapsule_GetPointer(capsule.ptr(), kBucketsName));
+}
+
+// Copies for tests and benchmarks; writing to them cannot change the descriptor.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> moe_bucket_snapshot(const pybind11::capsule& capsule) {
+  const auto& b = grouped_buckets(capsule);
+  const c10::DeviceGuard guard(b.perm.device());
+  return {b.perm.clone(), b.tiles.clone(), b.ntiles.clone()};
+}
+
+pybind11::capsule moe_bucket(torch::Tensor ids, int64_t E, const std::string& binpath) {
+  TORCH_CHECK(ids.dim() == 1 && ids.is_xpu() && ids.scalar_type() == at::kInt && ids.is_contiguous(),
+              "expert ids must be a contiguous rank-1 int32 XPU tensor");
+  check_aligned("expert_ids", ids.data_ptr());
+  const c10::DeviceGuard guard(ids.device());
+  const int device_index = ids.get_device();
+  auto& st = state_for(device_index, binpath);
+  sycl::queue& que = current_queue(device_index);
+  const int64_t P = ids.size(0);
+  TORCH_CHECK(E > 0, "empty expert table (E == 0)");
+  TORCH_CHECK(P > 0 && P <= kInt32Max / 4, "grouped MoE needs 0 < pairs <= 2^29, got ", P);
+  check_int32("E + 1", E + 1);
+  const int64_t buckets = E + 1;  // the last bucket collects out-of-range ids
+  const auto options = ids.options();
+  auto counts = torch::empty({buckets}, options);
+  auto perm = torch::empty({P}, options);
+  auto tiles = torch::empty({moe_max_tiles(P, buckets), 3}, options);
+  auto ntiles = torch::empty({1}, options);
+  for (const auto* t : {&ids, &counts, &perm, &tiles, &ntiles}) record_input_stream(*t, device_index);
+  const void* ip = ids.data_ptr();
+  const void* cp = counts.data_ptr();
+  const void* pp = perm.data_ptr();
+  const void* tp = tiles.data_ptr();
+  const void* np = ntiles.data_ptr();
+  const int e32 = (int)E, p32 = (int)P, b32 = (int)buckets, rows32 = (int)kMoeTileRows;
+  const auto ctx = que.get_context();
+
+  submit_nd(que, kernel_obj(st, ctx, "hf_moe_bucket_zero", 2), (buckets + 15) / 16, 1, 16, [&](sycl::handler& h) {
+    set_ptr_arg(h, 0, cp); h.set_arg(1, b32);
+  });
+  submit_nd(que, kernel_obj(st, ctx, "hf_moe_bucket_count", 4), (P + 15) / 16, 1, 16, [&](sycl::handler& h) {
+    set_ptr_arg(h, 0, ip); set_ptr_arg(h, 1, cp); h.set_arg(2, e32); h.set_arg(3, p32);
+  });
+  submit_nd(que, kernel_obj(st, ctx, "hf_moe_bucket_scan", 5), 1, 1, 1, [&](sycl::handler& h) {
+    set_ptr_arg(h, 0, cp); set_ptr_arg(h, 1, tp); set_ptr_arg(h, 2, np); h.set_arg(3, b32); h.set_arg(4, rows32);
+  });
+  submit_nd(que, kernel_obj(st, ctx, "hf_moe_bucket_scatter", 5), (P + 15) / 16, 1, 16, [&](sycl::handler& h) {
+    set_ptr_arg(h, 0, ip); set_ptr_arg(h, 1, cp); set_ptr_arg(h, 2, pp); h.set_arg(3, e32); h.set_arg(4, p32);
+  });
+  auto owned = std::make_unique<GroupedBuckets>(GroupedBuckets{perm, tiles, ntiles, P, E, device_index});
+  pybind11::capsule capsule(static_cast<const void*>(owned.get()), kBucketsName, [](PyObject* o) {
+    delete static_cast<GroupedBuckets*>(PyCapsule_GetPointer(o, kBucketsName));
+  });
+  owned.release();
+  return capsule;
+}
+
+torch::Tensor moe_rotate(torch::Tensor x, torch::Tensor signs, const std::string& binpath) {
+  TORCH_CHECK(x.dim() == 2 && x.is_xpu() && x.scalar_type() == at::kBFloat16 && x.is_contiguous(),
+              "native moe_rotate requires a contiguous rank-2 bf16 XPU input");
+  TORCH_CHECK(signs.dim() == 1 && signs.is_xpu() && signs.scalar_type() == at::kChar && signs.is_contiguous(),
+              "signs must be contiguous rank-1 int8 XPU");
+  const c10::DeviceGuard guard(x.device());
+  const int device_index = x.get_device();
+  auto& st = state_for(device_index, binpath);
+  sycl::queue& que = current_queue(device_index);
+  check_same_device(x, signs, "signs");
+  const int64_t M = x.size(0), K = x.size(1);
+  check_int32("M", M);
+  check_int32("K", K);
+  const int block = had_block_of(K);
+  TORCH_CHECK(signs.numel() == K, "signs length ", signs.numel(), " != K ", K);
+  check_aligned("x", x.data_ptr());
+  check_aligned("signs", signs.data_ptr());
+  auto out = torch::empty({M, K}, x.options().dtype(at::kFloat));
+  if (M == 0) return out;
+  check_aligned("rotated activation", out.data_ptr());
+  const auto& k = kernel_obj(st, que.get_context(), "hf_moe_rotate_had" + std::to_string(block), 4);
+  for (const auto* t : {&x, &signs, &out}) record_input_stream(*t, device_index);
+  const void* xp = x.data_ptr();
+  const void* sp = signs.data_ptr();
+  const void* op = out.data_ptr();
+  const int k32 = (int)K;
+  submit_nd(que, k, 1, M, 128, [&](sycl::handler& h) {
+    set_ptr_arg(h, 0, xp); set_ptr_arg(h, 1, sp); set_ptr_arg(h, 2, op); h.set_arg(3, k32);
+  });
+  return out;
+}
+
+torch::Tensor moe_tile(torch::Tensor xr, torch::Tensor q, torch::Tensor u, torch::Tensor d,
+                       std::optional<torch::Tensor> bias, const pybind11::capsule& capsule, int64_t in_div,
+                       bool out_f32, const std::string& binpath) {
+  TORCH_CHECK(xr.dim() == 2 && xr.is_xpu() && xr.scalar_type() == at::kFloat && xr.is_contiguous(),
+              "native moe_tile requires a contiguous rank-2 fp32 rotated activation");
+  TORCH_CHECK(q.dim() == 3 && u.dim() == 3 && d.dim() == 2, "moe q/u/d must be rank 3/3/2");
+  TORCH_CHECK(q.is_xpu() && u.is_xpu() && d.is_xpu() && q.is_contiguous() && u.is_contiguous() && d.is_contiguous(),
+              "packed tensors must be contiguous XPU tensors");
+  TORCH_CHECK(q.scalar_type() == at::kInt && u.scalar_type() == at::kShort && d.scalar_type() == at::kFloat,
+              "moe packed dtypes must be int32/int16/fp32");
+  const c10::DeviceGuard guard(xr.device());
+  const int device_index = xr.get_device();
+  auto& st = state_for(device_index, binpath);
+  sycl::queue& que = current_queue(device_index);
+  const auto& buckets = grouped_buckets(capsule);
+  const int64_t K = xr.size(1), E = d.size(0), N = d.size(1), P = buckets.pairs;
+  TORCH_CHECK(buckets.device_index == device_index, "bucket descriptor was built on XPU device ",
+              buckets.device_index, ", the activation is on device ", device_index);
+  TORCH_CHECK(buckets.num_experts == E, "bucket descriptor was built for E=", buckets.num_experts,
+              " experts, the expert table has E=", E);
+  const int block = had_block_of(K);
+  TORCH_CHECK(E > 0, "empty expert table (E == 0)");
+  TORCH_CHECK(q.size(0) == E && q.size(1) == K / 8 && q.size(2) == N, "moe q_pack shape mismatch");
+  TORCH_CHECK(u.size(0) == E && u.size(1) == K / 64 && u.size(2) == N, "moe u_pack shape mismatch");
+  TORCH_CHECK(in_div > 0 && P == xr.size(0) * in_div, "bucket descriptor was built for ", P,
+              " pairs, this batch has rows ", xr.size(0), " * in_div ", in_div);
+  const int64_t max_tiles = moe_max_tiles(P, E + 1);
+  torch::Tensor perm = buckets.perm, tiles = buckets.tiles, ntiles = buckets.ntiles;  // handles, no copy
+  check_same_device(xr, q, "q_pack");
+  check_same_device(xr, u, "u_pack");
+  check_same_device(xr, d, "d_row");
+  check_int32("N", N);
+  check_int32("K", K);
+  check_int32("E", E);
+  check_int32("in_div", in_div);
+  check_packed_weight_surface(q.data_ptr(), K / 8, N);
+  TORCH_CHECK((K / 8) * N * 4 % 64 == 0, "per-expert q_pack stride is not a multiple of 64 B");
+  check_aligned("rotated activation", xr.data_ptr());
+  check_aligned("u_pack", u.data_ptr());
+  check_aligned("d_row", d.data_ptr());
+  const float* biasp = nullptr;
+  if (bias.has_value() && bias->defined()) {
+    TORCH_CHECK(bias->is_xpu() && bias->scalar_type() == at::kFloat && bias->is_contiguous() &&
+                    bias->dim() == 2 && bias->size(0) == E && bias->size(1) == N,
+                "moe bias_corr must be a contiguous fp32 XPU tensor [E,N]");
+    check_same_device(xr, *bias, "bias_corr");
+    check_aligned("bias_corr", bias->data_ptr());
+    biasp = reinterpret_cast<const float*>(bias->data_ptr());
+  }
+  auto out = torch::empty({P, N}, xr.options().dtype(out_f32 ? at::kFloat : at::kBFloat16));
+  const std::string name = std::string("hf_moe_tile_had") + std::to_string(block) + (out_f32 ? "_f32" : "_bf16");
+  const auto& k = kernel_obj(st, que.get_context(), name, 13);
+  for (const auto* t : {&xr, &q, &u, &d, &perm, &tiles, &ntiles}) record_input_stream(*t, device_index);
+  record_optional_stream(bias, device_index);
+  const void* xp = xr.data_ptr();
+  const void* qp = q.data_ptr();
+  const void* up = u.data_ptr();
+  const void* dp = d.data_ptr();
+  const void* pp = perm.data_ptr();
+  const void* tp = tiles.data_ptr();
+  const void* np = ntiles.data_ptr();
+  const void* op = out.data_ptr();
+  const int n32 = (int)N, k32 = (int)K, e32 = (int)E, div32 = (int)in_div;
+  submit_nd(que, k, (N + 31) / 32, max_tiles, 128, [&](sycl::handler& h) {
+    set_ptr_arg(h, 0, xp);
+    set_ptr_arg(h, 1, qp);
+    set_ptr_arg(h, 2, up);
+    set_ptr_arg(h, 3, dp);
+    set_ptr_arg(h, 4, biasp);
+    set_ptr_arg(h, 5, pp);
+    set_ptr_arg(h, 6, tp);
+    set_ptr_arg(h, 7, np);
+    set_ptr_arg(h, 8, op);
+    h.set_arg(9, n32); h.set_arg(10, k32); h.set_arg(11, e32); h.set_arg(12, div32);
+  });
   return out;
 }
 
@@ -542,6 +902,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dpas_w4a8", &dpas_w4a8);
   m.def("fwht_dpas_w4a8", &fwht_dpas_w4a8);
   m.def("decode_fused", &decode_fused);
+  m.def("moe_pair", &moe_pair);
+  m.def("moe_bucket", &moe_bucket);
+  m.def("moe_bucket_snapshot", &moe_bucket_snapshot);
+  m.def("moe_rotate", &moe_rotate);
+  m.def("moe_tile", &moe_tile);
   m.def("probe_stream", &probe_stream);
   m.def("launch_mechanism", &launch_mechanism);
 }

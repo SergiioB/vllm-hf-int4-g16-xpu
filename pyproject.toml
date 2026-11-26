@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hf-int4-g16-xpu"
-version = "0.1.0"
-description = "vLLM XPU out-of-tree plugin for Had128NoPerm HF-INT4-G16"
+version = "0.2.0"
+description = "vLLM XPU out-of-tree plugin for Had128/Had64 HF-INT4-G16 (dense and MoE)"
 requires-python = ">=3.10"
 dependencies = []
 

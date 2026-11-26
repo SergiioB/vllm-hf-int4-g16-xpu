@@ -21,6 +21,7 @@ import torch
 
 from . import kernels_triton as tk
 from . import native_l0
+from .format import had_block_for_k
 
 
 def _validate_linear_inputs(
@@ -51,8 +52,7 @@ def _validate_linear_inputs(
         raise ValueError(f"signs must be rank-1 [K], got shape {tuple(signs.shape)}")
 
     m, k = x.shape
-    if k % 128:
-        raise ValueError(f"K must be a multiple of 128; got K={k}")
+    had_block_for_k(k)
     if q_pack.shape[0] * 8 != k:
         raise ValueError(f"q_pack K mismatch: shape {tuple(q_pack.shape)} for activation K={k}")
     if u_pack.shape[0] * 64 != k:
@@ -104,10 +104,10 @@ def _validate_linear_inputs(
 
 def _native_ok(x2: torch.Tensor, q_pack: torch.Tensor, u_pack: torch.Tensor,
                d_row: torch.Tensor, signs: torch.Tensor, n: int,
-               model_bias: torch.Tensor | None, bias_corr: torch.Tensor | None) -> bool:
+               model_bias: torch.Tensor | None, bias_corr: torch.Tensor | None, mode: str) -> bool:
     return native_l0.native_supported(
         x2, n, bias_present=model_bias is not None,
-        signs=signs, q_pack=q_pack, u_pack=u_pack, d_row=d_row, bias_corr=bias_corr,
+        signs=signs, q_pack=q_pack, u_pack=u_pack, d_row=d_row, bias_corr=bias_corr, dpas=mode == "w4a8",
     )
 
 
@@ -122,7 +122,12 @@ def _linear2d_impl(
     backend: str = "auto",
     mode: str = "auto",
 ) -> torch.Tensor:
-    """Compute one quantized linear for rank-2 ``x``."""
+    """Compute one quantized linear for rank-2 ``x``.
+
+    The Hadamard block follows from the activation width (``had_block_for_k``).
+    A caller that passes a row shard must keep the shard width a multiple of the
+    block chosen for the global K; the vLLM plugin enforces that.
+    """
     m, k, n = _validate_linear_inputs(x, q_pack, u_pack, d_row, signs, bias, bias_corr)
     if m == 0:
         return torch.empty((0, n), device=x.device, dtype=x.dtype)
@@ -135,7 +140,7 @@ def _linear2d_impl(
     if backend not in ("auto", "native", "triton"):
         raise ValueError(f"unknown backend {backend}")
 
-    native_ok = _native_ok(x, q_pack, u_pack, d_row, signs, n, bias, bias_corr)
+    native_ok = _native_ok(x, q_pack, u_pack, d_row, signs, n, bias, bias_corr, mode)
     use_native = backend == "native" or (backend == "auto" and native_ok)
     if backend == "native" and not native_ok:
         raise RuntimeError(

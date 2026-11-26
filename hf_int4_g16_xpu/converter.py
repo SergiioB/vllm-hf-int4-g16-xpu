@@ -1,4 +1,13 @@
-"""Streaming BF16/FP16 safetensors -> HF-INT4-G16 converter."""
+"""Streaming BF16/FP16 safetensors -> HF-INT4-G16 converter (dense and MoE).
+
+Dense Had128-only checkpoints are written as ``hf_int4_g16/1``.  Any Had64
+projection or packed routed expert makes the output ``hf_int4_g16/2``.
+
+``--biascorr-scope``: ``none`` writes no correction, ``shared_only`` corrects
+every dense linear (attention and shared MLPs) and no expert, ``all_experts``
+also corrects each routed expert over the calibration tokens routed to it
+(zero for an expert that received none).
+"""
 from __future__ import annotations
 
 import argparse
@@ -18,21 +27,34 @@ from safetensors.torch import save_file
 from .calibration import (
     load_corpus_calibration,
     load_mixed_train_calibration,
+    require_chat_template,
     stream_calibration_means,
 )
+from .experts_source import require_packable, scan_experts
 from .format import (
+    EXPERT_PROJECTIONS,
+    EXPERT_TENSOR_SUFFIXES,
     FORMAT_VERSION,
+    FORMAT_VERSION_V2,
     GROUP_SIZE,
+    HAD_BLOCK_RULE_V2,
     HAD_SEED,
     HADAMARD_BLOCK,
+    ROTATION_V1,
+    ROTATION_V2,
+    had_block_for_k,
     quantize_pack_hf_int4,
-    rotate_had128_noperm,
+    rotate_had_noperm,
     sign_sha256_for_k,
     signs_for_k,
     unpack_hf_int4_reference,
 )
 
-DEFAULT_SKIP = "lm_head,embed_tokens,mtp,visual,vision_tower,multi_modal_projector,router,experts"
+# Routers stay in the source dtype: "router" (Gemma4, Granite router.layer),
+# ".gate." (Qwen/OLMoE/Granite routers) and "shared_expert_gate".
+DEFAULT_SKIP = ("lm_head,embed_tokens,mtp,visual,vision_tower,audio_tower,multi_modal_projector,"
+                "router,.gate.,shared_expert_gate")
+BIASCORR_SCOPES = ("none", "shared_only", "all_experts")
 
 
 def norm_key(k: str) -> str:
@@ -143,118 +165,63 @@ def decoder_linear_eligibility(key: str, shape, dtype, patterns: list[str]) -> t
     n, k = int(shape[0]), int(shape[1])
     if n <= 0 or k <= 0:
         return False, "rank-or-shape"
-    if k % HADAMARD_BLOCK:
-        return False, f"K={k} not divisible by 128"
+    if k % 64:
+        return False, f"K={k} not divisible by 128 (Had128) or 64 (Had64)"
     return True, "eligible"
 
 
-def read_corpus(path: Path) -> list[str]:
-    if path.suffix == ".parquet":
-        import pyarrow.parquet as pq
-        tbl = pq.read_table(path)
-        col = "text" if "text" in tbl.column_names else tbl.column_names[0]
-        return [str(x) for x in tbl[col].to_pylist()]
-    return [path.read_text(errors="ignore")]
+def _nagel_bias(weight: torch.Tensor, packed: dict, mean_x: torch.Tensor, mean_rx: torch.Tensor,
+                device: str) -> torch.Tensor:
+    """FP32 original mean response minus quantized rotated mean rotated response,
+    i.e. each in the basis in which that weight consumes its input."""
+    w_fp32 = weight.to(device=device, dtype=torch.float32)
+    wi = unpack_hf_int4_reference(packed["q_pack"].to(device), packed["u_pack"].to(device)).float()
+    what = wi * packed["d_row"].to(device)[:, None]
+    bc = (w_fp32 @ mean_x.to(device)) - (what @ mean_rx.to(device))
+    if not torch.isfinite(bc).all().item():
+        raise ValueError("non-finite bias_corr")
+    return bc.cpu().float()
 
 
-@torch.no_grad()
-def calibrate_rotated_means(
-    model_dir: Path,
-    module_names: list[str],
-    corpus_path: Path,
-    device: str,
-    max_tokens: int = 2048,
-    max_rows: int = 65536,
-) -> dict[str, torch.Tensor]:
-    """Measure pos0-excluded E[rotated x] with forward pre-hooks.
+def resolve_biascorr_scope(scope: str | None, biascorr: bool, corpus: str | None) -> str:
+    requested = bool(biascorr or corpus)
+    if scope is None:
+        return "shared_only" if requested else "none"
+    if scope not in BIASCORR_SCOPES:
+        raise ValueError(f"biascorr_scope must be one of {BIASCORR_SCOPES}, got {scope!r}")
+    if scope == "none" and requested:
+        raise ValueError("--biascorr-scope none contradicts --biascorr / --biascorr-corpus")
+    return scope
 
-    This path is intentionally generic HuggingFace code.  It is appropriate for
-    small verification models and documents the exact math for Wave-2 large
-    conversions; large-model conversion can supply precomputed means in a future
-    streaming implementation without changing the checkpoint format.
-    """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model_dir)
-    texts = read_corpus(corpus_path)
-    ids: list[int] = []
-    for text in texts:
-        ids.extend(tok.encode(text, add_special_tokens=True))
-        if len(ids) >= max_tokens:
-            break
-    ids = ids[:max_tokens]
-    if len(ids) < 16:
-        raise ValueError("bias-correction corpus produced fewer than 16 tokens")
+def _metadata_reader(src: Path, wmap: dict[str, str]):
+    """``(read, meta)`` over the source shards, keeping at most two handles open."""
+    handles: dict = {}
 
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_dir), torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
-    ).to(device)
-    model.eval()
+    def handle(key):
+        fn = wmap[key]
+        if fn not in handles:
+            # Keys are sorted and normally shard-local.
+            if len(handles) >= 2:
+                handles.clear()
+            handles[fn] = safe_open(str(src / fn), framework="pt", device="cpu")
+        return handles[fn]
 
-    module_map = dict(model.named_modules())
-    missing = [m for m in module_names if m not in module_map]
-    if missing:
-        raise ValueError(f"calibration target modules not found: {missing[:8]}")
-    sums = {m: None for m in module_names}
-    counts = {m: 0 for m in module_names}
-    hooks = []
+    def read(key, index=None):
+        if index is None:
+            return handle(key).get_tensor(key)
+        return handle(key).get_slice(key)[index]
 
-    def make_hook(name):
-        def hook(mod, inputs):
-            if not inputs:
-                return
-            x = inputs[0]
-            if not torch.is_tensor(x) or x.ndim < 2:
-                return
-            k = x.shape[-1]
-            if k % HADAMARD_BLOCK:
-                return
-            xx = x.reshape(-1, x.shape[-2] if x.ndim >= 2 else 1, k) if x.ndim > 2 else x
-            # Exclude position zero of every sequence.  For flattened batches the
-            # second dimension is sequence position in standard decoder modules.
-            if xx.ndim == 3:
-                xx = xx[:, 1:, :]
-            else:
-                xx = xx[1:, :]
-            xx = xx.reshape(-1, k)
-            if xx.shape[0] == 0:
-                return
-            signs = signs_for_k(k, HAD_SEED, x.device)
-            xr = rotate_had128_noperm(xx, signs).sum(dim=0, dtype=torch.float32)
-            if sums[name] is None:
-                sums[name] = torch.zeros_like(xr)
-            sums[name] += xr
-            counts[name] += xx.shape[0]
-        return hook
+    def meta(key):
+        sl = handle(key).get_slice(key)
+        return list(sl.get_shape()), str(sl.get_dtype())
 
-    for name in module_names:
-        hooks.append(module_map[name].register_forward_pre_hook(make_hook(name)))
-    try:
-        rows = 0
-        pos = 0
-        seq_len = min(2048, max(32, len(ids)))
-        while pos + 2 < len(ids) and rows < max_rows:
-            chunk = ids[pos:pos + seq_len]
-            if len(chunk) < 2:
-                break
-            batch = torch.tensor([chunk], dtype=torch.long, device=device)
-            model(batch, use_cache=False)
-            rows += batch.numel() - 1
-            pos += seq_len
-    finally:
-        for h in hooks:
-            h.remove()
-        del model
-        gc.collect()
-        if device.startswith("xpu"):
-            torch.xpu.empty_cache()
+    return read, meta, handles
 
-    out = {}
-    for name in module_names:
-        if sums[name] is None or counts[name] == 0:
-            raise ValueError(f"no activation samples captured for {name}")
-        out[name] = (sums[name] / counts[name]).cpu().float()
-    return out
+
+def _source_config(src: Path) -> dict:
+    path = src / "config.json"
+    return json.loads(path.read_text()) if path.exists() else {}
 
 
 def dry_run_layer_mapping(input_dir: str | Path, skip_patterns: str = DEFAULT_SKIP) -> dict:
@@ -268,23 +235,25 @@ def dry_run_layer_mapping(input_dir: str | Path, skip_patterns: str = DEFAULT_SK
     wmap, _ = load_index(src)
     patterns = [p.strip() for p in skip_patterns.split(",") if p.strip()]
     candidates = []
+    # "k_not_multiple_128" counts widths no Hadamard block fits (not 128 and not 64).
     excluded = {"skip_pattern_or_not_linear": 0, "k_not_multiple_128": 0, "rank_or_shape": 0}
     examples = {"skipped": [], "quantized": []}
-    shard_handles = {}
-
-    def meta_for(key):
-        fn = wmap[key]
-        if fn not in shard_handles:
-            if len(shard_handles) >= 2:
-                shard_handles.clear()
-            shard_handles[fn] = safe_open(str(src / fn), framework="pt", device="cpu")
-        sl = shard_handles[fn].get_slice(key)
-        return sl.get_shape(), sl.get_dtype()
+    _, meta_for, shard_handles = _metadata_reader(src, wmap)
 
     try:
-        for key in sorted(wmap):
+        bf16_expert_keys: set[str] = set()
+        experts = scan_experts(
+            sorted(wmap), meta_for, _source_config(src),
+            skipped=lambda name: should_skip(name, patterns), opted_out=bf16_expert_keys,
+        )
+        require_packable(experts)
+        expert_keys = {k for source in experts for k in source.keys}
+        for key in sorted(set(wmap) - expert_keys):
             shape, dtype = meta_for(key)
-            eligible, reason = decoder_linear_eligibility(key, shape, dtype, patterns)
+            if key in bf16_expert_keys:
+                eligible, reason = False, "expert-bank-opted-out"
+            else:
+                eligible, reason = decoder_linear_eligibility(key, shape, dtype, patterns)
             if not eligible:
                 if reason.startswith("K="):
                     excluded["k_not_multiple_128"] += 1
@@ -311,6 +280,13 @@ def dry_run_layer_mapping(input_dir: str | Path, skip_patterns: str = DEFAULT_SK
         "last_layer": layers[-1] if layers else None,
         "excluded": excluded,
         "examples": examples,
+        "expert_namespaces": [
+            {"namespace": x.namespace, "num_experts": x.num_experts, "hidden_size": x.hidden_size,
+             "intermediate_size": x.intermediate_size,
+             "layout": "per_expert" if x.per_expert_keys is not None else "fused_3d",
+             "had_block": {proj: had_block_for_k(x.shape(proj)[1]) for proj in EXPERT_PROJECTIONS}}
+            for x in experts
+        ],
         "keys": [c["key"] for c in candidates],
     }
 
@@ -327,7 +303,12 @@ def convert(
     cal_mode: str = "auto",
     seed: int = HAD_SEED,
     quantize_fn=quantize_pack_hf_int4,
+    biascorr_scope: str | None = None,
+    cal_chat_template: bool = False,
 ) -> dict:
+    scope = resolve_biascorr_scope(biascorr_scope, biascorr, biascorr_corpus)
+    if cal_chat_template and scope == "none":
+        raise ValueError("--cal-chat-template does nothing without BiasCorr calibration (--biascorr-scope is none)")
     src = Path(input_dir)
     final_dst = Path(output_dir)
     if src.resolve() == final_dst.resolve():
@@ -339,6 +320,13 @@ def convert(
     stage = final_dst.parent / (final_dst.name + ".hf-int4-stage")
     if stage.exists():
         raise ValueError(f"stale conversion staging directory exists: {stage}")
+    tok = None
+    if scope != "none":
+        # Loaded before anything is written, so a missing chat template leaves no staging directory.
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(str(src))
+        if cal_chat_template:
+            require_chat_template(tok)
     if final_dst.exists():
         final_dst.rmdir()  # empty only, checked above
     stage.mkdir(parents=True)
@@ -349,22 +337,25 @@ def convert(
     all_keys = sorted(wmap)
 
     # First pass over metadata only: decide quantization set.
-    tensor_meta = {}
-    shard_handles = {}
-    def meta_for(key):
-        fn = wmap[key]
-        if fn not in shard_handles:
-            # Keep a small cache; keys are sorted and normally shard-local.
-            if len(shard_handles) >= 2:
-                shard_handles.clear()
-            shard_handles[fn] = safe_open(str(src / fn), framework="pt", device="cpu")
-        f = shard_handles[fn]
-        sl = f.get_slice(key)
-        return sl.get_shape(), sl.get_dtype()
+    read, meta_for, shard_handles = _metadata_reader(src, wmap)
+    config = _source_config(src)
+    bf16_expert_keys: set[str] = set()
+    expert_sources = scan_experts(
+        all_keys, meta_for, config,
+        skipped=lambda name: should_skip(name, patterns), opted_out=bf16_expert_keys,
+    )
+    require_packable(expert_sources)
+    expert_keys = {k for source in expert_sources for k in source.keys}
 
     quantizable = []
     skipped = {}
     for key in all_keys:
+        if key in expert_keys:
+            continue
+        if key in bf16_expert_keys:
+            # An opted-out bank stays whole: none of it is a dense linear.
+            skipped[key] = "expert-bank-opted-out"
+            continue
         shape, dtype = meta_for(key)
         eligible, reason = decoder_linear_eligibility(key, shape, dtype, patterns)
         if not eligible:
@@ -372,53 +363,69 @@ def convert(
             continue
         n, k = shape
         quantizable.append((key, tuple(shape)))
-    for f in shard_handles.values():
-        del f
     shard_handles.clear()
 
     means = {}
+    expert_stats: dict[str, dict[str, torch.Tensor]] = {}
     calibration_info = None
     streaming_meta = None
-    if biascorr or biascorr_corpus:
-        from transformers import AutoTokenizer
-        print(f"[convert] streaming pos0-excluded calibration for {len(quantizable)} linears", flush=True)
-        tok = AutoTokenizer.from_pretrained(str(src))
+    if scope != "none":
+        print(f"[convert] streaming pos0-excluded calibration for {len(quantizable)} linears "
+              f"(biascorr_scope={scope})", flush=True)
         if cal_mode == "mixed_train" or (cal_mode == "auto" and not biascorr_corpus):
-            cal = load_mixed_train_calibration(tok, tokens_per_split=max(16, biascorr_tokens // 2))
+            cal = load_mixed_train_calibration(
+                tok, tokens_per_split=max(16, biascorr_tokens // 2), chat_template=cal_chat_template
+            )
         elif biascorr_corpus:
-            cal = load_corpus_calibration(tok, Path(biascorr_corpus), max_tokens=biascorr_tokens)
+            cal = load_corpus_calibration(
+                tok, Path(biascorr_corpus), max_tokens=biascorr_tokens, chat_template=cal_chat_template
+            )
         else:
             raise ValueError("--biascorr requires --cal-mode mixed_train or --biascorr-corpus")
-        means, streaming_meta = stream_calibration_means(src, wmap, cal, device, seed=seed)
+        # The forward needs every expert, including namespaces kept in BF16.
+        all_sources = scan_experts(all_keys, meta_for, config)
+        shard_handles.clear()
+        means, streaming_meta = stream_calibration_means(
+            src, wmap, cal, device, seed=seed, expert_sources=all_sources,
+            expert_stats=expert_stats if scope == "all_experts" else None,
+        )
         calibration_info = dict(cal.info)
         calibration_info["streaming"] = streaming_meta
         missing_cal = [k[: -len(".weight")] for k, _ in quantizable if k[: -len(".weight")] not in means]
         if missing_cal:
             raise ValueError(f"streaming calibration did not capture quantized decoder linears: {missing_cal[:8]}")
+        if scope == "all_experts":
+            uncaptured = [x.namespace for x in expert_sources if x.namespace not in expert_stats]
+            if uncaptured:
+                raise ValueError(f"streaming calibration did not capture routed experts: {uncaptured[:8]}")
 
     quant_shapes = dict(quantizable)
     writer = ShardWriter(dst, max_shard_bytes)
     manifest = {}
-    shard_handles = {}
-    stats = {"quantized_linears": 0, "copied_tensors": 0, "skipped_linears": 0, "biascorr_linears": 0}
+    moe_manifest = {}
+    expert_routing = {}
+    expert_ks: set[int] = set()
+    stats = {"quantized_linears": 0, "copied_tensors": 0, "skipped_linears": 0, "biascorr_linears": 0,
+             "had64_linears": 0, "expert_namespaces": 0, "quantized_expert_matrices": 0,
+             "had64_expert_matrices": 0, "biascorr_expert_matrices": 0}
 
-    def get_tensor(key):
-        fn = wmap[key]
-        if fn not in shard_handles:
-            if len(shard_handles) >= 2:
-                shard_handles.clear()
-            shard_handles[fn] = safe_open(str(src / fn), framework="pt", device="cpu")
-        return shard_handles[fn].get_tensor(key)
+    def release_device_memory():
+        gc.collect()
+        if device.startswith("xpu"):
+            torch.xpu.empty_cache()
 
     try:
         for key in all_keys:
+            if key in expert_keys:
+                continue
             if key not in quant_shapes:
-                writer.add(key, get_tensor(key))
+                writer.add(key, read(key))
                 stats["copied_tensors"] += 1
                 continue
             n, k = quant_shapes[key]
-            print(f"[convert] quantize {key} [{n},{k}]", flush=True)
-            w = get_tensor(key)
+            block = had_block_for_k(k)
+            print(f"[convert] quantize {key} [{n},{k}] Had{block}", flush=True)
+            w = read(key)
             packed = quantize_fn(w, seed=seed, device=device)
             prefix = key[: -len(".weight")]
             writer.add(prefix + ".q_pack", packed["q_pack"])
@@ -427,7 +434,7 @@ def convert(
             entry = {
                 "shape": [n, k],
                 "group_size": GROUP_SIZE,
-                "hadamard_block": HADAMARD_BLOCK,
+                "hadamard_block": block,
                 "layout": "xe2_dpas_native_v1",
                 "q_pack_shape": [k // 8, n],
                 "u_pack_shape": [k // 64, n],
@@ -435,40 +442,83 @@ def convert(
             }
             if means:
                 pair = means[prefix]
-                mean_x = pair["mean_x"].to(device)
-                mean_rx = pair["mean_rx"].to(device)
-                # Explicit Nagel correction in FP32, in the basis in which each
-                # linear actually consumes x: reference original-weight mean
-                # response minus quantized rotated-weight mean rotated response.
-                w_fp32 = w.to(device=device, dtype=torch.float32)
-                wi = unpack_hf_int4_reference(packed["q_pack"].to(device), packed["u_pack"].to(device)).float()
-                what = wi * packed["d_row"].to(device)[:, None]
-                bc = (w_fp32 @ mean_x) - (what @ mean_rx)
-                if not torch.isfinite(bc).all().item():
-                    raise ValueError(f"non-finite bias_corr for {prefix}")
-                writer.add(prefix + ".bias_corr", bc.cpu().float())
+                writer.add(prefix + ".bias_corr", _nagel_bias(w, packed, pair["mean_x"], pair["mean_rx"], device))
                 entry["bias_corr"] = True
                 stats["biascorr_linears"] += 1
+            if norm_key(prefix) in manifest:
+                raise ValueError(f"two checkpoint linears normalize to the same module name: {norm_key(prefix)}")
             manifest[norm_key(prefix)] = entry
             stats["quantized_linears"] += 1
+            stats["had64_linears"] += block == 64
             del w, packed
-            gc.collect()
-            if device.startswith("xpu"):
-                torch.xpu.empty_cache()
+            release_device_memory()
+
+        for source in expert_sources:
+            namespace = norm_key(source.namespace)
+            if namespace in moe_manifest:
+                raise ValueError(f"two expert namespaces normalize to the same module name: {namespace}")
+            routing = expert_stats.get(source.namespace)
+            print(f"[convert] quantize experts {source.namespace} E={source.num_experts} "
+                  f"H={source.hidden_size} I={source.intermediate_size}", flush=True)
+            for expert in range(source.num_experts):
+                for proj in EXPERT_PROJECTIONS:
+                    n, k = source.shape(proj)
+                    w = source.read(read, expert, proj).contiguous()
+                    packed = quantize_fn(w, seed=seed, device=device)
+                    prefix = f"{source.namespace}.{expert}.{proj}"
+                    for role, tensor in packed.items():
+                        writer.add(f"{prefix}.{EXPERT_TENSOR_SUFFIXES[role]}", tensor)
+                    if routing is not None:
+                        bc = torch.zeros(n, dtype=torch.float32)
+                        if int(routing["counts"][expert]) > 0:
+                            mean_x = routing["mean_down" if proj == "down_proj" else "mean_x"][expert].to(device)
+                            mean_rx = rotate_had_noperm(mean_x[None], signs_for_k(k, seed, device))[0]
+                            bc = _nagel_bias(w, packed, mean_x, mean_rx, device)
+                        writer.add(f"{prefix}.{EXPERT_TENSOR_SUFFIXES['bias_corr']}", bc)
+                        stats["biascorr_expert_matrices"] += 1
+                    stats["quantized_expert_matrices"] += 1
+                    stats["had64_expert_matrices"] += had_block_for_k(k) == 64
+                    del w, packed
+            moe_manifest[namespace] = {
+                "num_experts": source.num_experts,
+                "hidden_size": source.hidden_size,
+                "intermediate_size": source.intermediate_size,
+                "projections": {
+                    proj: {"had_block": had_block_for_k(source.shape(proj)[1]), "bias_corr": routing is not None}
+                    for proj in EXPERT_PROJECTIONS
+                },
+            }
+            if routing is not None:
+                counts = routing["counts"]
+                expert_routing[namespace] = {
+                    "routed_tokens_min": int(counts.min()), "routed_tokens_max": int(counts.max()),
+                    "experts_without_tokens": int((counts == 0).sum()),
+                }
+            expert_ks.update((source.hidden_size, source.intermediate_size))
+            stats["expert_namespaces"] += 1
+            release_device_memory()
     finally:
         shard_handles.clear()
 
     weight_map_out, shard_names, total_bytes = writer.finish()
 
-    unique_ks = sorted({int(shape[1]) for shape in quant_shapes.values()})
+    unique_ks = sorted({int(shape[1]) for shape in quant_shapes.values()} | expert_ks)
+    version_2 = bool(moe_manifest) or stats["had64_linears"] > 0
+    if version_2:
+        for entry in manifest.values():
+            entry["had_block"] = entry.pop("hadamard_block")
     sign_sha256_by_k = {str(k): sign_sha256_for_k(k, seed) for k in unique_ks}
 
+    block_fields = (
+        {"had_block_rule": HAD_BLOCK_RULE_V2}
+        if version_2 else {"hadamard_block": HADAMARD_BLOCK}
+    )
     qconfig = {
         "quant_method": "hf_int4_g16",
-        "format_version": FORMAT_VERSION,
+        "format_version": FORMAT_VERSION_V2 if version_2 else FORMAT_VERSION,
         "group_size": GROUP_SIZE,
-        "hadamard_block": HADAMARD_BLOCK,
-        "rotation": "Had128NoPerm",
+        **block_fields,
+        "rotation": ROTATION_V2 if version_2 else ROTATION_V1,
         "had_seed": int(seed),
         "sign_generation": "torch.Generator(cpu).manual_seed(had_seed * 100003 + K); randint(0,2)*2-1",
         "sign_sha256_by_k": sign_sha256_by_k,
@@ -481,6 +531,14 @@ def convert(
         },
         "quantized_modules": manifest,
     }
+    if version_2:
+        qconfig["biascorr_scope"] = scope
+        if moe_manifest:
+            qconfig["moe_modules"] = moe_manifest
+            qconfig["layout_spec"]["expert_tensors"] = (
+                "<ns>.<e>.<gate_proj|up_proj|down_proj>.<qweight=q_pack|scales=u_pack|"
+                "scale_super=d_row|bias_corr>"
+            )
     if calibration_info:
         qconfig["calibration"] = calibration_info
         qconfig["cal_token_sha256"] = calibration_info.get("cal_token_sha256")
@@ -522,7 +580,7 @@ def convert(
                     raise ValueError(
                         f"reloaded tensor {key} metadata mismatch: {shape}/{dtype} != {tuple(want_shape)}/{want_dtype}"
                     )
-                if key.endswith(".d_row"):
+                if key.endswith((".d_row", "." + EXPERT_TENSOR_SUFFIXES["d_row"])):
                     vals = f.get_tensor(key)
                     if vals.dtype != torch.float32 or not torch.isfinite(vals).all() or not (vals > 0).all():
                         raise ValueError(f"d_row tensor {key} is not finite positive fp32")
@@ -549,6 +607,10 @@ def convert(
         "reload_verified_tensors": verified,
         "total_bytes": total_bytes,
         "calibration": calibration_info,
+        "cal_chat_template": bool(cal_chat_template),
+        "format_version": qconfig["format_version"],
+        "biascorr_scope": scope,
+        "expert_routing_calibration": expert_routing,
         "atomic_publish": "verified-staging-os.replace",
     }
     (dst / "hf_int4_g16_conversion_report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -565,10 +627,15 @@ def main(argv=None):
     ap.add_argument("--skip-patterns", default=DEFAULT_SKIP)
     ap.add_argument("--max-shard-gib", type=float, default=2.0)
     ap.add_argument("--biascorr", action="store_true", help="Enable streaming pos0-excluded BiasCorr calibration")
+    ap.add_argument("--biascorr-scope", choices=list(BIASCORR_SCOPES), default=None,
+                    help="none | shared_only (dense linears only; the default with --biascorr) | all_experts")
     ap.add_argument("--biascorr-corpus", default=None, help="Optional custom corpus file/parquet (legacy corpus mode)")
     ap.add_argument("--biascorr-tokens", type=int, default=2048)
     ap.add_argument("--cal-mode", choices=["auto", "mixed_train", "corpus_file"], default="auto",
                     help="mixed_train: 1024 WikiText-2 train + 1024 disjoint Python-stdlib tokens")
+    ap.add_argument("--cal-chat-template", action="store_true",
+                    help="Wrap each calibration text block as a user turn with the tokenizer's chat_template "
+                         "and generation prompt; fails if the tokenizer has none")
     ap.add_argument("--dry-run-mapping", action="store_true", help="Only audit decoder linear mapping; write nothing")
     ap.add_argument("--had-seed", type=int, default=HAD_SEED)
     args = ap.parse_args(argv)
@@ -585,6 +652,8 @@ def main(argv=None):
         biascorr=args.biascorr,
         cal_mode=args.cal_mode,
         seed=args.had_seed,
+        biascorr_scope=args.biascorr_scope,
+        cal_chat_template=args.cal_chat_template,
     )
 
 

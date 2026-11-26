@@ -47,76 +47,113 @@ inline void fwht128_sg16(float v[8], const int lane) {
     }
 }
 
-// =========================================================================
-// 2. SINGLE-PASS FUSED ContigFWHT128 + Per-Token INT8 ActQ
-// =========================================================================
-__attribute__((intel_reqd_sub_group_size(16)))
-kernel void fused_fwht128_actq(
-    global const ushort* X_bf16,
-    global const char*   Signs,
-    global char*         X_i8,
-    global float*        Sx,
-    const int K
-) {
-    local float sg_max[16];
-
-    const int m = get_group_id(0);
-    const int lid = get_local_id(0);
-    const int sg = lid >> 4;
-    const int lane = lid & 15;
-    const int nblocks = K >> 7;
-
-    global const ushort* row_in = X_bf16 + (long)m * K;
-    float local_max = 1e-12f;
-
-    for (int blk = sg; blk < nblocks; blk += 16) {
-        const int base = blk << 7;
-        ushort8 raw = intel_sub_group_block_read_us8(row_in + base);
-        float v[8];
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            int idx = base + j * 16 + lane;
-            v[j] = intel_convert_as_bfloat16_float(raw[j]) * (float)Signs[idx];
-        }
-        fwht128_sg16(v, lane);
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            local_max = fmax(local_max, fabs(v[j]));
-        }
+// In-register 64-point FWHT across 16 subgroup lanes (4 floats/lane).  Lane
+// bits are element-index bits 0..3 and j is bits 4..5, like the 128 variant.
+inline void fwht64_sg16(float v[4], const int lane) {
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float o = sub_group_shuffle_xor(v[j], 1);
+        v[j] = (lane & 1) ? (o - v[j]) : (v[j] + o);
     }
-
-    float sgm = sub_group_reduce_max(local_max);
-    if (lane == 0) sg_max[sg] = sgm;
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    float rmax = sub_group_reduce_max(sg_max[lane]);
-    const float scale = rmax / 127.0f;
-    const float inv_scale = 127.0f / rmax;
-    if (lid == 0) Sx[m] = scale;
-
-    global char* row_out = X_i8 + (long)m * K;
-    // Pass 2: re-read the bf16 input and re-run the exact in-register FP32
-    // butterfly.  No FP16 staging exists anywhere in ACTQ: large finite values
-    // cannot overflow to inf, ties reach rint in FP32, and the kernel needs no
-    // 34-68 KiB row SLM allocation at all.
-    for (int blk = sg; blk < nblocks; blk += 16) {
-        const int base = blk << 7;
-        ushort8 rawq = intel_sub_group_block_read_us8(row_in + base);
-        float vq[8];
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            int idx = base + j * 16 + lane;
-            vq[j] = intel_convert_as_bfloat16_float(rawq[j]) * (float)Signs[idx];
-        }
-        fwht128_sg16(vq, lane);
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            int idx = base + j * 16 + lane;
-            float q = clamp(rint(vq[j] * inv_scale), -127.0f, 127.0f);
-            row_out[idx] = (char)((int)q);
-        }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float o = sub_group_shuffle_xor(v[j], 2);
+        v[j] = (lane & 2) ? (o - v[j]) : (v[j] + o);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float o = sub_group_shuffle_xor(v[j], 4);
+        v[j] = (lane & 4) ? (o - v[j]) : (v[j] + o);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float o = sub_group_shuffle_xor(v[j], 8);
+        v[j] = (lane & 8) ? (o - v[j]) : (v[j] + o);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j += 2) {
+        float a = v[j], b = v[j + 1];
+        v[j] = a + b; v[j + 1] = a - b;
+    }
+    const float inv_s = 0.125f; // 1 / sqrt(64), exact in FP32
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        float a = v[j], b = v[j + 2];
+        v[j]     = (a + b) * inv_s;
+        v[j + 2] = (a - b) * inv_s;
     }
 }
+
+// =========================================================================
+// 2. SINGLE-PASS FUSED BlockFWHT (128 or 64) + Per-Token INT8 ActQ
+// =========================================================================
+#define DEFINE_FWHT_ACTQ(NAME, NJ, VEC_T, BLOCK_READ, FWHT, BLK_SHIFT)                              \
+__attribute__((intel_reqd_sub_group_size(16)))                                                      \
+kernel void NAME(                                                                                   \
+    global const ushort* X_bf16,                                                                    \
+    global const char*   Signs,                                                                     \
+    global char*         X_i8,                                                                      \
+    global float*        Sx,                                                                        \
+    const int K                                                                                     \
+) {                                                                                                 \
+    local float sg_max[16];                                                                         \
+                                                                                                    \
+    const int m = get_group_id(0);                                                                  \
+    const int lid = get_local_id(0);                                                                \
+    const int sg = lid >> 4;                                                                        \
+    const int lane = lid & 15;                                                                      \
+    const int nblocks = K >> (BLK_SHIFT);                                                           \
+                                                                                                    \
+    global const ushort* row_in = X_bf16 + (long)m * K;                                             \
+    float local_max = 1e-12f;                                                                       \
+                                                                                                    \
+    for (int blk = sg; blk < nblocks; blk += 16) {                                                  \
+        const int base = blk << (BLK_SHIFT);                                                        \
+        VEC_T raw = BLOCK_READ(row_in + base);                                                      \
+        float v[NJ];                                                                                \
+        _Pragma("unroll")                                                                           \
+        for (int j = 0; j < (NJ); j++) {                                                            \
+            int idx = base + j * 16 + lane;                                                         \
+            v[j] = intel_convert_as_bfloat16_float(raw[j]) * (float)Signs[idx];                     \
+        }                                                                                           \
+        FWHT(v, lane);                                                                              \
+        _Pragma("unroll")                                                                           \
+        for (int j = 0; j < (NJ); j++) {                                                            \
+            local_max = fmax(local_max, fabs(v[j]));                                                \
+        }                                                                                           \
+    }                                                                                               \
+                                                                                                    \
+    float sgm = sub_group_reduce_max(local_max);                                                    \
+    if (lane == 0) sg_max[sg] = sgm;                                                                \
+    barrier(CLK_LOCAL_MEM_FENCE);                                                                   \
+                                                                                                    \
+    float rmax = sub_group_reduce_max(sg_max[lane]);                                                \
+    const float scale = rmax / 127.0f;                                                              \
+    const float inv_scale = 127.0f / rmax;                                                          \
+    if (lid == 0) Sx[m] = scale;                                                                    \
+                                                                                                    \
+    global char* row_out = X_i8 + (long)m * K;                                                      \
+    for (int blk = sg; blk < nblocks; blk += 16) {                                                  \
+        const int base = blk << (BLK_SHIFT);                                                        \
+        VEC_T rawq = BLOCK_READ(row_in + base);                                                     \
+        float vq[NJ];                                                                               \
+        _Pragma("unroll")                                                                           \
+        for (int j = 0; j < (NJ); j++) {                                                            \
+            int idx = base + j * 16 + lane;                                                         \
+            vq[j] = intel_convert_as_bfloat16_float(rawq[j]) * (float)Signs[idx];                   \
+        }                                                                                           \
+        FWHT(vq, lane);                                                                             \
+        _Pragma("unroll")                                                                           \
+        for (int j = 0; j < (NJ); j++) {                                                            \
+            int idx = base + j * 16 + lane;                                                         \
+            float q = clamp(rint(vq[j] * inv_scale), -127.0f, 127.0f);                              \
+            row_out[idx] = (char)((int)q);                                                          \
+        }                                                                                           \
+    }                                                                                               \
+}
+
+DEFINE_FWHT_ACTQ(fused_fwht128_actq, 8, ushort8, intel_sub_group_block_read_us8, fwht128_sg16, 7)
+DEFINE_FWHT_ACTQ(fused_fwht64_actq, 4, ushort4, intel_sub_group_block_read_us4, fwht64_sg16, 6)
 
 // =========================================================================
 // 3. BIT-EXACT SWAR 4-WEIGHT-AT-ONCE IN-REGISTER UNPACK + SAFE U LOAD
@@ -590,61 +627,49 @@ DEFINE_BF16_DPAS_TALL(bf16_m128_n16, 128, 1, 16, 2, 8)
 // =========================================================================
 // 6. HARDENED M=1..4 FUSED IN-REGISTER FWHT-128 + HF-INT4-G16 DECODE
 // =========================================================================
-#define DEFINE_HF_DECODE_FUSED(NAME, M_VAL)                                                      \
-__attribute__((intel_reqd_sub_group_size(16)))                                                   \
-kernel void NAME(                                                                                \
-    global const ushort* X_raw_bf16,                                                             \
-    global const char*   Signs,                                                                  \
-    global const uint*   W_packed,                                                               \
-    global const ushort* U_packed,                                                               \
-    global const float*  D_row,                                                                  \
-    global const float*  Bias,                                                                   \
-    global ushort*       C_bf16,                                                                 \
-    const int N, const int K                                                                     \
-) {                                                                                              \
-    local float slm_part[8][M_VAL][2][16];                                                       \
-    const int n0 = get_group_id(0) * 32;                                                         \
-    const int sg = get_sub_group_id();                                                           \
-    const int lane = get_sub_group_local_id();                                                   \
-    if (n0 >= N) return;                                                                         \
-    const bool has1 = (n0 + 16 < N);                                                             \
-                                                                                                 \
-    const int n_b128 = K >> 7;                                                                   \
-    float acc0[M_VAL], acc1[M_VAL];                                                              \
-    _Pragma("unroll") for (int m = 0; m < M_VAL; m++) { acc0[m] = 0.0f; acc1[m] = 0.0f; }        \
-                                                                                                 \
-    for (int b128 = sg; b128 < n_b128; b128 += 8) {                                              \
-        const int base = b128 << 7;                                                              \
-        float xv[M_VAL][8];                                                                      \
-        float sgn[8];                                                                            \
-        _Pragma("unroll") for (int j = 0; j < 8; j++) sgn[j] = (float)Signs[base + j * 16 + lane]; \
-        _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                      \
-            ushort8 xraw = intel_sub_group_block_read_us8(X_raw_bf16 + (long)m * K + base);      \
-            _Pragma("unroll") for (int j = 0; j < 8; j++)                                        \
-                xv[m][j] = intel_convert_as_bfloat16_float(xraw[j]) * sgn[j];                    \
-            fwht128_sg16(xv[m], lane);                                                           \
-        }                                                                                        \
-        _Pragma("unroll") for (int h = 0; h < 2; h++) {                                          \
-            const int kb = b128 * 2 + h;                                                         \
-            uint w0[8], w1[8];                                                                   \
-            intel_sub_group_2d_block_read_32b_8r16x1c((global void*)W_packed, N*4, K>>3, N*4, (int2)(n0,      kb*8), w0); \
-            if (has1) {                                                                          \
-                intel_sub_group_2d_block_read_32b_8r16x1c((global void*)W_packed, N*4, K>>3, N*4, (int2)(n0 + 16, kb*8), w1); \
-            } else {                                                                             \
-                _Pragma("unroll") for (int j = 0; j < 8; j++) w1[j] = 0u;                        \
-            }                                                                                    \
-            const uint u4_0 = load_u4_safe(U_packed, kb, N, n0, lane);                           \
-            const uint u4_1 = has1 ? load_u4_safe(U_packed, kb, N, n0 + 16, lane) : 0u;          \
-            _Pragma("unroll") for (int g4 = 0; g4 < 4; g4++) {                                   \
-                const float ug0 = (float)(((u4_0 >> (4 * g4)) & 0xFu) + 1u);                     \
-                const float ug1 = (float)(((u4_1 >> (4 * g4)) & 0xFu) + 1u);                     \
-                const uint wa0 = w0[2 * g4], wb0 = w0[2 * g4 + 1];                               \
-                const uint wa1 = w1[2 * g4], wb1 = w1[2 * g4 + 1];                               \
-                _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                              \
-                    const float xl = xv[m][h * 4 + g4];                                          \
-                    const float xsum = sub_group_reduce_add(xl);                                 \
-                    float s0 = -8.0f * xsum, s1 = -8.0f * xsum;                                  \
-                    float xb;                                                                    \
+#define HF_DECODE_BODY(M_VAL, NJ, VEC_T, BLOCK_READ, FWHT, BLK_SHIFT, TO_OUT)                       \
+    const int n0 = get_group_id(0) * 32;                                                            \
+    const int sg = get_sub_group_id();                                                              \
+    const int lane = get_sub_group_local_id();                                                      \
+    if (n0 >= N) return;                                                                            \
+    const bool has1 = (n0 + 16 < N);                                                                \
+                                                                                                    \
+    const int n_blk = K >> (BLK_SHIFT);                                                             \
+    float acc0[M_VAL], acc1[M_VAL];                                                                 \
+    _Pragma("unroll") for (int m = 0; m < M_VAL; m++) { acc0[m] = 0.0f; acc1[m] = 0.0f; }           \
+                                                                                                    \
+    for (int blk = sg; blk < n_blk; blk += 8) {                                                     \
+        const int base = blk << (BLK_SHIFT);                                                        \
+        float xv[M_VAL][NJ];                                                                        \
+        float sgn[NJ];                                                                              \
+        _Pragma("unroll") for (int j = 0; j < (NJ); j++) sgn[j] = (float)Signs[base + j * 16 + lane]; \
+        _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                         \
+            VEC_T xraw = BLOCK_READ(X_base + (long)m * K + base);                                   \
+            _Pragma("unroll") for (int j = 0; j < (NJ); j++)                                        \
+                xv[m][j] = intel_convert_as_bfloat16_float(xraw[j]) * sgn[j];                       \
+            FWHT(xv[m], lane);                                                                      \
+        }                                                                                           \
+        _Pragma("unroll") for (int h = 0; h < (NJ) / 4; h++) {                                      \
+            const int kb = blk * ((NJ) / 4) + h;                                                    \
+            uint w0[8], w1[8];                                                                      \
+            intel_sub_group_2d_block_read_32b_8r16x1c((global void*)W_base, N*4, K>>3, N*4, (int2)(n0,      kb*8), w0); \
+            if (has1) {                                                                             \
+                intel_sub_group_2d_block_read_32b_8r16x1c((global void*)W_base, N*4, K>>3, N*4, (int2)(n0 + 16, kb*8), w1); \
+            } else {                                                                                \
+                _Pragma("unroll") for (int j = 0; j < 8; j++) w1[j] = 0u;                           \
+            }                                                                                       \
+            const uint u4_0 = load_u4_safe(U_base, kb, N, n0, lane);                                \
+            const uint u4_1 = has1 ? load_u4_safe(U_base, kb, N, n0 + 16, lane) : 0u;               \
+            _Pragma("unroll") for (int g4 = 0; g4 < 4; g4++) {                                      \
+                const float ug0 = (float)(((u4_0 >> (4 * g4)) & 0xFu) + 1u);                        \
+                const float ug1 = (float)(((u4_1 >> (4 * g4)) & 0xFu) + 1u);                        \
+                const uint wa0 = w0[2 * g4], wb0 = w0[2 * g4 + 1];                                  \
+                const uint wa1 = w1[2 * g4], wb1 = w1[2 * g4 + 1];                                  \
+                _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                 \
+                    const float xl = xv[m][h * 4 + g4];                                             \
+                    const float xsum = sub_group_reduce_add(xl);                                    \
+                    float s0 = -8.0f * xsum, s1 = -8.0f * xsum;                                     \
+                    float xb;                                                                       \
                     xb = sub_group_broadcast(xl,  0); s0 = fma(xb, (float)( wa0        & 0xFu), s0); s1 = fma(xb, (float)( wa1        & 0xFu), s1); \
                     xb = sub_group_broadcast(xl,  1); s0 = fma(xb, (float)((wa0 >>  8) & 0xFu), s0); s1 = fma(xb, (float)((wa1 >>  8) & 0xFu), s1); \
                     xb = sub_group_broadcast(xl,  2); s0 = fma(xb, (float)((wa0 >> 16) & 0xFu), s0); s1 = fma(xb, (float)((wa1 >> 16) & 0xFu), s1); \
@@ -661,35 +686,315 @@ kernel void NAME(                                                               
                     xb = sub_group_broadcast(xl, 13); s0 = fma(xb, (float)((wb0 >> 12) & 0xFu), s0); s1 = fma(xb, (float)((wb1 >> 12) & 0xFu), s1); \
                     xb = sub_group_broadcast(xl, 14); s0 = fma(xb, (float)((wb0 >> 20) & 0xFu), s0); s1 = fma(xb, (float)((wb1 >> 20) & 0xFu), s1); \
                     xb = sub_group_broadcast(xl, 15); s0 = fma(xb, (float)((wb0 >> 28) & 0xFu), s0); s1 = fma(xb, (float)((wb1 >> 28) & 0xFu), s1); \
-                    acc0[m] = fma(s0, ug0, acc0[m]);                                             \
-                    acc1[m] = fma(s1, ug1, acc1[m]);                                             \
-                }                                                                                \
-            }                                                                                    \
-        }                                                                                        \
-    }                                                                                            \
-    _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                          \
-        slm_part[sg][m][0][lane] = acc0[m];                                                      \
-        slm_part[sg][m][1][lane] = acc1[m];                                                      \
-    }                                                                                            \
-    barrier(CLK_LOCAL_MEM_FENCE);                                                                \
-    if (sg == 0) {                                                                               \
-        const int c0 = n0 + lane, c1 = n0 + 16 + lane;                                           \
-        const float d0 = (c0 < N) ? D_row[c0] : 0.0f, b0 = (Bias != 0 && c0 < N) ? Bias[c0] : 0.0f;           \
-        const float d1 = (c1 < N) ? D_row[c1] : 0.0f, b1 = (Bias != 0 && c1 < N) ? Bias[c1] : 0.0f;           \
-        _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                      \
-            float t0 = 0.0f, t1 = 0.0f;                                                          \
-            _Pragma("unroll") for (int s = 0; s < 8; s++) {                                      \
-                t0 += slm_part[s][m][0][lane]; t1 += slm_part[s][m][1][lane];                    \
-            }                                                                                    \
-            if (c0 < N) C_bf16[(long)m * N + c0] = intel_convert_bfloat16_as_ushort(fma(t0, d0, b0)); \
-            if (c1 < N) C_bf16[(long)m * N + c1] = intel_convert_bfloat16_as_ushort(fma(t1, d1, b1)); \
-        }                                                                                        \
-    }                                                                                            \
+                    acc0[m] = fma(s0, ug0, acc0[m]);                                                \
+                    acc1[m] = fma(s1, ug1, acc1[m]);                                                \
+                }                                                                                   \
+            }                                                                                       \
+        }                                                                                           \
+    }                                                                                               \
+    _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                             \
+        slm_part[sg][m][0][lane] = acc0[m];                                                         \
+        slm_part[sg][m][1][lane] = acc1[m];                                                         \
+    }                                                                                               \
+    barrier(CLK_LOCAL_MEM_FENCE);                                                                   \
+    if (sg == 0) {                                                                                  \
+        const int c0 = n0 + lane, c1 = n0 + 16 + lane;                                              \
+        const float d0 = (c0 < N) ? D_base[c0] : 0.0f, b0 = (B_base != 0 && c0 < N) ? B_base[c0] : -0.0f; \
+        const float d1 = (c1 < N) ? D_base[c1] : 0.0f, b1 = (B_base != 0 && c1 < N) ? B_base[c1] : -0.0f; \
+        _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                         \
+            float t0 = 0.0f, t1 = 0.0f;                                                             \
+            _Pragma("unroll") for (int s = 0; s < 8; s++) {                                         \
+                t0 += slm_part[s][m][0][lane]; t1 += slm_part[s][m][1][lane];                       \
+            }                                                                                       \
+            if (c0 < N) C_base[(long)m * N + c0] = TO_OUT(fma(t0, d0, b0));                         \
+            if (c1 < N) C_base[(long)m * N + c1] = TO_OUT(fma(t1, d1, b1));                         \
+        }                                                                                           \
+    }
+
+#define HF_BF16_OUT(v) intel_convert_bfloat16_as_ushort(v)
+#define HF_F32_OUT(v) (v)
+
+#define DEFINE_HF_DECODE_FUSED(NAME, M_VAL, NJ, VEC_T, BLOCK_READ, FWHT, BLK_SHIFT)                 \
+__attribute__((intel_reqd_sub_group_size(16)))                                                      \
+kernel void NAME(                                                                                   \
+    global const ushort* X_base,                                                                    \
+    global const char*   Signs,                                                                     \
+    global const uint*   W_base,                                                                    \
+    global const ushort* U_base,                                                                    \
+    global const float*  D_base,                                                                    \
+    global const float*  B_base,                                                                    \
+    global ushort*       C_base,                                                                    \
+    const int N, const int K                                                                        \
+) {                                                                                                 \
+    local float slm_part[8][M_VAL][2][16];                                                          \
+    HF_DECODE_BODY(M_VAL, NJ, VEC_T, BLOCK_READ, FWHT, BLK_SHIFT, HF_BF16_OUT)                      \
 }
 
-DEFINE_HF_DECODE_FUSED(hf_decode_fused_m1, 1)
-DEFINE_HF_DECODE_FUSED(hf_decode_fused_m2, 2)
-DEFINE_HF_DECODE_FUSED(hf_decode_fused_m4, 4)
+DEFINE_HF_DECODE_FUSED(hf_decode_fused_m1, 1, 8, ushort8, intel_sub_group_block_read_us8, fwht128_sg16, 7)
+DEFINE_HF_DECODE_FUSED(hf_decode_fused_m2, 2, 8, ushort8, intel_sub_group_block_read_us8, fwht128_sg16, 7)
+DEFINE_HF_DECODE_FUSED(hf_decode_fused_m4, 4, 8, ushort8, intel_sub_group_block_read_us8, fwht128_sg16, 7)
+DEFINE_HF_DECODE_FUSED(hf_decode_fused_had64_m1, 1, 4, ushort4, intel_sub_group_block_read_us4, fwht64_sg16, 6)
+DEFINE_HF_DECODE_FUSED(hf_decode_fused_had64_m2, 2, 4, ushort4, intel_sub_group_block_read_us4, fwht64_sg16, 6)
+DEFINE_HF_DECODE_FUSED(hf_decode_fused_had64_m4, 4, 4, ushort4, intel_sub_group_block_read_us4, fwht64_sg16, 6)
+
+// =========================================================================
+// 6B. GROUPED ROUTED-EXPERT (MoE) W4A16 PAIR KERNEL
+//     One work-group row per (token, slot) pair p = get_group_id(1).  The pair
+//     reads input row p / in_div and the packed weights of expert Ids[p] from
+//     3D [E, K/8, N] storage.  Routing is read on the device, so the launch
+//     shape is independent of which experts were picked (graph-replay safe).
+//     An expert id outside [0, E) writes zeros.  That branch is uniform for the
+//     whole work-group, so no barrier is skipped by only part of it.
+// =========================================================================
+#define DEFINE_HF_MOE_PAIR(NAME, NJ, VEC_T, BLOCK_READ, FWHT, BLK_SHIFT, OUT_T, TO_OUT)             \
+__attribute__((intel_reqd_sub_group_size(16)))                                                      \
+kernel void NAME(                                                                                   \
+    global const ushort* X,                                                                         \
+    global const char*   Signs,                                                                     \
+    global const uint*   W,                                                                         \
+    global const ushort* U,                                                                         \
+    global const float*  D,                                                                         \
+    global const float*  Bias,                                                                      \
+    global const int*    Ids,                                                                       \
+    global OUT_T*        C,                                                                         \
+    const int N, const int K, const int E, const int in_div                                         \
+) {                                                                                                 \
+    local float slm_part[8][1][2][16];                                                              \
+    const int p = get_group_id(1);                                                                  \
+    const int e = Ids[p];                                                                           \
+    global OUT_T* C_base = C + (long)p * N;                                                         \
+    if (e < 0 || e >= E) {                                                                          \
+        const int col = get_group_id(0) * 32 + get_local_id(0);                                     \
+        if (get_local_id(0) < 32 && col < N) C_base[col] = (OUT_T)0;                                \
+        return;                                                                                     \
+    }                                                                                               \
+    global const ushort* X_base = X + (long)(p / in_div) * K;                                       \
+    global const uint*   W_base = W + (long)e * (K >> 3) * N;                                       \
+    global const ushort* U_base = U + (long)e * (K >> 6) * N;                                       \
+    global const float*  D_base = D + (long)e * N;                                                  \
+    global const float*  B_base = (Bias != 0) ? Bias + (long)e * N : Bias;                          \
+    HF_DECODE_BODY(1, NJ, VEC_T, BLOCK_READ, FWHT, BLK_SHIFT, TO_OUT)                               \
+}
+
+DEFINE_HF_MOE_PAIR(hf_moe_pair_had128_bf16, 8, ushort8, intel_sub_group_block_read_us8, fwht128_sg16, 7, ushort, HF_BF16_OUT)
+DEFINE_HF_MOE_PAIR(hf_moe_pair_had128_f32, 8, ushort8, intel_sub_group_block_read_us8, fwht128_sg16, 7, float, HF_F32_OUT)
+DEFINE_HF_MOE_PAIR(hf_moe_pair_had64_bf16, 4, ushort4, intel_sub_group_block_read_us4, fwht64_sg16, 6, ushort, HF_BF16_OUT)
+DEFINE_HF_MOE_PAIR(hf_moe_pair_had64_f32, 4, ushort4, intel_sub_group_block_read_us4, fwht64_sg16, 6, float, HF_F32_OUT)
+
+// =========================================================================
+// 6C. GROUPED-BY-EXPERT W4A16 (MoE PREFILL)
+//     The same math as the pair kernel, with the routed pairs bucketed by
+//     expert on the device so one work-group reads and unpacks an expert's
+//     weight panel once for up to HF_MOE_TILE_ROWS token rows.  Per output
+//     row the operation sequence is the pair kernel's: the same FWHT, the same
+//     16-wide FMA chain, the same eight per-subgroup partials in K order, the
+//     same reduction and epilogue.  Results are bit-identical to it, wherever
+//     a pair lands in a tile.  Every launch shape depends only on
+//     (pairs, E, N, K).  Integer atomics order the buckets; no output is ever
+//     accumulated atomically.
+// =========================================================================
+inline int hf_moe_bucket_of(const int e, const int E) {
+    return (e >= 0 && e < E) ? e : E;  // bucket E: out-of-range ids
+}
+
+kernel void hf_moe_bucket_zero(global int* Counts, const int B) {
+    const int b = get_global_id(0);
+    if (b < B) Counts[b] = 0;
+}
+
+kernel void hf_moe_bucket_count(global const int* Ids, volatile global int* Counts, const int E, const int P) {
+    const int p = get_global_id(0);
+    if (p < P) atomic_inc(&Counts[hf_moe_bucket_of(Ids[p], E)]);
+}
+
+// One work-item.  Exclusive scan in place (Counts becomes each bucket's write
+// cursor) and one (bucket, start, length) descriptor per tile.
+kernel void hf_moe_bucket_scan(global int* Counts, global int* Tiles, global int* NTiles,
+                               const int B, const int ROWS) {
+    int offset = 0, tile = 0;
+    for (int b = 0; b < B; b++) {
+        const int count = Counts[b];
+        Counts[b] = offset;
+        for (int s = 0; s < count; s += ROWS) {
+            Tiles[3 * tile] = b;
+            Tiles[3 * tile + 1] = offset + s;
+            Tiles[3 * tile + 2] = min(ROWS, count - s);
+            tile++;
+        }
+        offset += count;
+    }
+    NTiles[0] = tile;
+}
+
+kernel void hf_moe_bucket_scatter(global const int* Ids, volatile global int* Cursor, global int* Perm,
+                                  const int E, const int P) {
+    const int p = get_global_id(0);
+    if (p < P) Perm[atomic_inc(&Cursor[hf_moe_bucket_of(Ids[p], E)])] = p;
+}
+
+// One work-group per activation row: rotate it once, in FP32, for every slot
+// and every output column that will read it.
+#define DEFINE_HF_MOE_ROTATE(NAME, NJ, VEC_T, BLOCK_READ, FWHT, BLK_SHIFT)                          \
+__attribute__((intel_reqd_sub_group_size(16)))                                                      \
+kernel void NAME(global const ushort* X, global const char* Signs, global float* Xr, const int K) { \
+    const int row = get_group_id(1);                                                                \
+    const int sg = get_sub_group_id();                                                              \
+    const int lane = get_sub_group_local_id();                                                      \
+    const int n_blk = K >> (BLK_SHIFT);                                                             \
+    for (int blk = sg; blk < n_blk; blk += 8) {                                                     \
+        const int base = blk << (BLK_SHIFT);                                                        \
+        VEC_T xraw = BLOCK_READ(X + (long)row * K + base);                                          \
+        float v[NJ];                                                                                \
+        _Pragma("unroll") for (int j = 0; j < (NJ); j++)                                            \
+            v[j] = intel_convert_as_bfloat16_float(xraw[j]) * (float)Signs[base + j * 16 + lane];   \
+        FWHT(v, lane);                                                                              \
+        _Pragma("unroll") for (int j = 0; j < (NJ); j++)                                            \
+            Xr[(long)row * K + base + j * 16 + lane] = v[j];                                        \
+    }                                                                                               \
+}
+
+DEFINE_HF_MOE_ROTATE(hf_moe_rotate_had128, 8, ushort8, intel_sub_group_block_read_us8, fwht128_sg16, 7)
+DEFINE_HF_MOE_ROTATE(hf_moe_rotate_had64, 4, ushort4, intel_sub_group_block_read_us4, fwht64_sg16, 6)
+
+// Tile body for a row class of M_VAL (the tile holds `len` <= M_VAL real rows;
+// padding rows repeat the last one and are never stored).  The expert's Q and
+// U panel for 64 input positions is read once, its nibbles are expanded to
+// FP32 once per 16 positions, and both are applied to all M_VAL rows.
+#define HF_MOE_TILE_BODY(M_VAL, NJ, BLK_SHIFT, OUT_ELEM, TO_OUT)                                    \
+    {                                                                                               \
+    int pr[M_VAL];                                                                                  \
+    long xoff[M_VAL];                                                                               \
+    float acc0[M_VAL], acc1[M_VAL];                                                                 \
+    _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                             \
+        pr[m] = Perm[start + min(m, len - 1)];                                                      \
+        xoff[m] = (long)(pr[m] / in_div) * K;                                                       \
+        acc0[m] = 0.0f; acc1[m] = 0.0f;                                                             \
+    }                                                                                               \
+    for (int blk = sg; blk < n_blk; blk += 8) {                                                     \
+        const int base = blk << (BLK_SHIFT);                                                        \
+        _Pragma("unroll") for (int h = 0; h < (NJ) / 4; h++) {                                      \
+            const int kb = blk * ((NJ) / 4) + h;                                                    \
+            uint w0[8], w1[8];                                                                      \
+            intel_sub_group_2d_block_read_32b_8r16x1c((global void*)W_base, N*4, K>>3, N*4, (int2)(n0,      kb*8), w0); \
+            if (has1) {                                                                             \
+                intel_sub_group_2d_block_read_32b_8r16x1c((global void*)W_base, N*4, K>>3, N*4, (int2)(n0 + 16, kb*8), w1); \
+            } else {                                                                                \
+                _Pragma("unroll") for (int j = 0; j < 8; j++) w1[j] = 0u;                           \
+            }                                                                                       \
+            const uint u4_0 = load_u4_safe(U_base, kb, N, n0, lane);                                \
+            const uint u4_1 = has1 ? load_u4_safe(U_base, kb, N, n0 + 16, lane) : 0u;               \
+            _Pragma("unroll") for (int g4 = 0; g4 < 4; g4++) {                                      \
+                const float ug0 = (float)(((u4_0 >> (4 * g4)) & 0xFu) + 1u);                        \
+                const float ug1 = (float)(((u4_1 >> (4 * g4)) & 0xFu) + 1u);                        \
+                const uint wa0 = w0[2 * g4], wb0 = w0[2 * g4 + 1];                                  \
+                const uint wa1 = w1[2 * g4], wb1 = w1[2 * g4 + 1];                                  \
+                float wf0[16], wf1[16];                                                             \
+                HF_MOE_UNPACK16(wf0, wa0, wb0)                                                      \
+                HF_MOE_UNPACK16(wf1, wa1, wb1)                                                      \
+                const int at = base + (h * 4 + g4) * 16;                                            \
+                _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                 \
+                    const float xl = as_float(intel_sub_group_block_read(                           \
+                        (const global uint*)(Xr + xoff[m] + at)));                                  \
+                    const float xsum = sub_group_reduce_add(xl);                                    \
+                    float s0 = -8.0f * xsum, s1 = -8.0f * xsum;                                     \
+                    float xb;                                                                       \
+                    HF_MOE_FMA(0)  HF_MOE_FMA(1)  HF_MOE_FMA(2)  HF_MOE_FMA(3)                      \
+                    HF_MOE_FMA(4)  HF_MOE_FMA(5)  HF_MOE_FMA(6)  HF_MOE_FMA(7)                      \
+                    HF_MOE_FMA(8)  HF_MOE_FMA(9)  HF_MOE_FMA(10) HF_MOE_FMA(11)                     \
+                    HF_MOE_FMA(12) HF_MOE_FMA(13) HF_MOE_FMA(14) HF_MOE_FMA(15)                     \
+                    acc0[m] = fma(s0, ug0, acc0[m]);                                                \
+                    acc1[m] = fma(s1, ug1, acc1[m]);                                                \
+                }                                                                                   \
+            }                                                                                       \
+        }                                                                                           \
+    }                                                                                               \
+    _Pragma("unroll") for (int m = 0; m < M_VAL; m++) {                                             \
+        slm_part[sg][m][0][lane] = acc0[m];                                                         \
+        slm_part[sg][m][1][lane] = acc1[m];                                                         \
+    }                                                                                               \
+    barrier(CLK_LOCAL_MEM_FENCE);                                                                   \
+    if (sg == 0) {                                                                                  \
+        const int c0 = n0 + lane, c1 = n0 + 16 + lane;                                              \
+        const float d0 = (c0 < N) ? D_base[c0] : 0.0f, b0 = (B_base != 0 && c0 < N) ? B_base[c0] : -0.0f; \
+        const float d1 = (c1 < N) ? D_base[c1] : 0.0f, b1 = (B_base != 0 && c1 < N) ? B_base[c1] : -0.0f; \
+        for (int m = 0; m < len; m++) {                                                             \
+            float t0 = 0.0f, t1 = 0.0f;                                                             \
+            _Pragma("unroll") for (int s = 0; s < 8; s++) {                                         \
+                t0 += slm_part[s][m][0][lane]; t1 += slm_part[s][m][1][lane];                       \
+            }                                                                                       \
+            global OUT_ELEM* C_base = C + (long)Perm[start + m] * N;                                \
+            if (c0 < N) C_base[c0] = TO_OUT(fma(t0, d0, b0));                                       \
+            if (c1 < N) C_base[c1] = TO_OUT(fma(t1, d1, b1));                                       \
+        }                                                                                           \
+    }                                                                                               \
+    }
+
+// Position i of a 16-wide group, in the interleaved nibble order of q_pack.
+#define HF_MOE_UNPACK16(F, A, B)                                                                    \
+    F[0]  = (float)( A        & 0xFu); F[1]  = (float)((A >>  8) & 0xFu);                           \
+    F[2]  = (float)((A >> 16) & 0xFu); F[3]  = (float)((A >> 24) & 0xFu);                           \
+    F[4]  = (float)((A >>  4) & 0xFu); F[5]  = (float)((A >> 12) & 0xFu);                           \
+    F[6]  = (float)((A >> 20) & 0xFu); F[7]  = (float)((A >> 28) & 0xFu);                           \
+    F[8]  = (float)( B        & 0xFu); F[9]  = (float)((B >>  8) & 0xFu);                           \
+    F[10] = (float)((B >> 16) & 0xFu); F[11] = (float)((B >> 24) & 0xFu);                           \
+    F[12] = (float)((B >>  4) & 0xFu); F[13] = (float)((B >> 12) & 0xFu);                           \
+    F[14] = (float)((B >> 20) & 0xFu); F[15] = (float)((B >> 28) & 0xFu);
+
+#define HF_MOE_FMA(I) xb = sub_group_broadcast(xl, I); s0 = fma(xb, wf0[I], s0); s1 = fma(xb, wf1[I], s1);
+
+// Grid: (ceil(N/32), max_tiles).  Tiles past the device-side count return.
+// Both early exits are uniform for the whole work-group.
+#define DEFINE_HF_MOE_TILE(NAME, NJ, BLK_SHIFT, OUT_T, TO_OUT)                                      \
+__attribute__((intel_reqd_sub_group_size(16)))                                                      \
+kernel void NAME(                                                                                   \
+    global const float*  Xr,                                                                        \
+    global const uint*   W,                                                                         \
+    global const ushort* U,                                                                         \
+    global const float*  D,                                                                         \
+    global const float*  Bias,                                                                      \
+    global const int*    Perm,                                                                      \
+    global const int*    Tiles,                                                                     \
+    global const int*    NTiles,                                                                    \
+    global OUT_T*        C,                                                                         \
+    const int N, const int K, const int E, const int in_div                                         \
+) {                                                                                                 \
+    local float slm_part[8][16][2][16];                                                             \
+    const int tile = get_group_id(1);                                                               \
+    if (tile >= NTiles[0]) return;                                                                  \
+    const int e = Tiles[3 * tile], start = Tiles[3 * tile + 1], len = Tiles[3 * tile + 2];          \
+    const int n0 = get_group_id(0) * 32;                                                            \
+    const int sg = get_sub_group_id();                                                              \
+    const int lane = get_sub_group_local_id();                                                      \
+    if (n0 >= N) return;                                                                            \
+    if (e >= E) {                                                                                   \
+        const int col = n0 + get_local_id(0);                                                       \
+        if (get_local_id(0) < 32 && col < N)                                                        \
+            for (int m = 0; m < len; m++) C[(long)Perm[start + m] * N + col] = (OUT_T)0;            \
+        return;                                                                                     \
+    }                                                                                               \
+    const bool has1 = (n0 + 16 < N);                                                                \
+    const int n_blk = K >> (BLK_SHIFT);                                                             \
+    global const uint*   W_base = W + (long)e * (K >> 3) * N;                                       \
+    global const ushort* U_base = U + (long)e * (K >> 6) * N;                                       \
+    global const float*  D_base = D + (long)e * N;                                                  \
+    global const float*  B_base = (Bias != 0) ? Bias + (long)e * N : Bias;                          \
+    if (len > 8) {                                                                                  \
+        HF_MOE_TILE_BODY(16, NJ, BLK_SHIFT, OUT_T, TO_OUT)                                         \
+    } else if (len > 4) {                                                                           \
+        HF_MOE_TILE_BODY(8, NJ, BLK_SHIFT, OUT_T, TO_OUT)                                          \
+    } else if (len > 2) {                                                                           \
+        HF_MOE_TILE_BODY(4, NJ, BLK_SHIFT, OUT_T, TO_OUT)                                          \
+    } else if (len > 1) {                                                                           \
+        HF_MOE_TILE_BODY(2, NJ, BLK_SHIFT, OUT_T, TO_OUT)                                          \
+    } else {                                                                                        \
+        HF_MOE_TILE_BODY(1, NJ, BLK_SHIFT, OUT_T, TO_OUT)                                          \
+    }                                                                                               \
+}
+
+DEFINE_HF_MOE_TILE(hf_moe_tile_had128_bf16, 8, 7, ushort, HF_BF16_OUT)
+DEFINE_HF_MOE_TILE(hf_moe_tile_had128_f32, 8, 7, float, HF_F32_OUT)
+DEFINE_HF_MOE_TILE(hf_moe_tile_had64_bf16, 4, 6, ushort, HF_BF16_OUT)
+DEFINE_HF_MOE_TILE(hf_moe_tile_had64_f32, 4, 6, float, HF_F32_OUT)
 
 // =========================================================================
 // 7. HARDENED MLX-ASYM-G64 M=1..4 DECODE BASELINE

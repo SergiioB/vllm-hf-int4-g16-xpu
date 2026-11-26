@@ -1,8 +1,9 @@
-"""vLLM out-of-tree quantization plugin for Had128NoPerm + HF-INT4-G16.
+"""vLLM out-of-tree quantization plugin for Had128/Had64 + HF-INT4-G16.
 
 The plugin is intentionally fail-closed: a module is quantized iff the
 checkpoint manifest contains its canonical packed tensors; malformed metadata,
-partial fused members, or orphan bias-correction keys are hard errors.
+partial fused members, missing expert tensors or orphan bias-correction keys are
+hard errors.
 """
 from __future__ import annotations
 
@@ -25,7 +26,30 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from .format import FORMAT_VERSION, GROUP_SIZE, HAD_SEED, HADAMARD_BLOCK, sign_sha256_for_k, signs_for_k
+from .format import (
+    FORMAT_VERSION,
+    FORMAT_VERSION_V2,
+    GROUP_SIZE,
+    HAD_BLOCK_RULE_V2,
+    HAD_SEED,
+    HADAMARD_BLOCK,
+    ROTATION_V1,
+    ROTATION_V2,
+    check_payload,
+    had_block_for_k,
+    is_json_int,
+    sign_sha256_for_k,
+    signs_for_k,
+)
+from .moe_admission import (
+    VISION_PARTS,
+    FullPrecisionBanks,
+    MoEModule,
+    PackedCoverage,
+    admit_expert_tensors,
+    is_expert_packed_name,
+    parse_moe_manifest,
+)
 from .ops import hf_int4_g16_linear
 
 logger = init_logger("vllm.hf_int4_g16_xpu")
@@ -37,7 +61,7 @@ FUSED = {
     "in_proj_ba": ["in_proj_b", "in_proj_a"],
 }
 QKV_IDS = {"q": 0, "k": 1, "v": 2}
-SKIP_PARTS = {"visual", "vision_tower", "multi_modal_projector"}
+_INT_FIELDS = ("group_size", "hadamard_block", "had_seed")
 
 
 def _env_choice(name: str, default: str, choices: set[str]) -> str:
@@ -66,6 +90,7 @@ def _norm_key(k: str) -> str:
     return parts[-1]
 
 
+_ROTATION_BY_VERSION = {FORMAT_VERSION: ROTATION_V1, FORMAT_VERSION_V2: ROTATION_V2}
 PACKED_SUFFIXES = (".q_pack", ".u_pack", ".d_row", ".bias_corr")
 CORE_PACKED_SUFFIXES = (".q_pack", ".u_pack", ".d_row")
 
@@ -103,6 +128,35 @@ def _read_safetensors_header(path: str) -> dict[str, Any]:
     return obj
 
 
+def _require_json_int(name: str, value: Any) -> int:
+    if not is_json_int(value):
+        raise ValueError(f"hf_int4_g16: {name} must be a JSON integer, got {value!r}")
+    return value
+
+
+# Runs once, eagerly, when torch.compile traces the first forward: coverage is
+# a property of the loaded model and cannot change between graph replays.
+@torch.compiler.assume_constant_result
+def _require_complete_coverage(config: "HFInt4G16Config") -> None:
+    config.require_complete_coverage()
+
+
+class _CoverageCheckedUnquantizedLinearMethod(UnquantizedLinearMethod):
+    """vLLM's unquantized method for linears this checkpoint leaves alone.
+
+    It carries the coverage check too: if every packed layer were renamed, no
+    packed method would exist to run it.
+    """
+
+    def __init__(self, config: "HFInt4G16Config"):
+        super().__init__()
+        self.hf_config = config
+
+    def apply(self, layer, x, bias=None):
+        _require_complete_coverage(self.hf_config)
+        return super().apply(layer, x, bias)
+
+
 def _header_shape_dtype(entry: Any) -> tuple[list[int], str]:
     if not isinstance(entry, dict):
         return [], ""
@@ -120,23 +174,34 @@ class HFInt4G16Config(QuantizationConfig):
         group_size: int = GROUP_SIZE,
         hadamard_block: int = HADAMARD_BLOCK,
         had_seed: int = HAD_SEED,
-        rotation: str = "Had128NoPerm",
+        rotation: str | None = None,
         layout: str = "xe2_dpas_native_v1",
         format_version: str = FORMAT_VERSION,
         quantized_modules: dict[str, dict[str, Any]] | None = None,
+        moe_modules: dict[str, Any] | None = None,
     ):
         super().__init__()
-        self.group_size = int(group_size)
-        self.hadamard_block = int(hadamard_block)
-        self.had_seed = int(had_seed)
-        self.rotation = rotation
+        self.group_size = _require_json_int("group_size", group_size)
+        self.hadamard_block = _require_json_int("hadamard_block", hadamard_block)
+        self.had_seed = _require_json_int("had_seed", had_seed)
+        self.rotation = rotation or _ROTATION_BY_VERSION.get(format_version, ROTATION_V1)
         self.layout = layout
         self.format_version = format_version
         self.quantized_modules = quantized_modules or {}
+        # Raw manifest until maybe_update_config() admits it, then MoEModule objects.
+        self.moe_modules: dict[str, Any] = moe_modules or {}
+        self.coverage = PackedCoverage()
+        self.full_precision_banks: FullPrecisionBanks | None = None
+        # Model-architecture facts, set by bind_architecture().  Without them no
+        # name alias applies.
+        self.mamba_registered_as_mixer = False
+        self.k_eq_v_layers: frozenset[int] = frozenset()
+        self.model_dropped_modules: frozenset[str] = frozenset()
 
     def __repr__(self):
-        return (f"HFInt4G16Config(group_size={self.group_size}, hadamard_block={self.hadamard_block}, "
-                f"had_seed={self.had_seed}, modules={len(self.quantized_modules)})")
+        return (f"HFInt4G16Config(format_version={self.format_version}, group_size={self.group_size}, "
+                f"had_seed={self.had_seed}, modules={len(self.quantized_modules)}, "
+                f"moe_modules={len(self.moe_modules)})")
 
     def get_name(self):
         return "hf_int4_g16"
@@ -159,19 +224,54 @@ class HFInt4G16Config(QuantizationConfig):
             group_size=q.get("group_size", GROUP_SIZE),
             hadamard_block=q.get("hadamard_block", HADAMARD_BLOCK),
             had_seed=q.get("had_seed", HAD_SEED),
-            rotation=q.get("rotation", "Had128NoPerm"),
+            rotation=q.get("rotation"),
             layout=q.get("layout", "xe2_dpas_native_v1"),
             format_version=q.get("format_version", FORMAT_VERSION),
             quantized_modules=q.get("quantized_modules") or q.get("modules") or {},
+            moe_modules=q.get("moe_modules") or {},
         )
 
     def validate_format(self):
         if self.group_size != GROUP_SIZE:
             raise ValueError(f"hf_int4_g16: unsupported group_size {self.group_size}")
-        if self.hadamard_block != HADAMARD_BLOCK or self.rotation != "Had128NoPerm":
-            raise ValueError(f"hf_int4_g16: unsupported rotation {self.rotation}/{self.hadamard_block}")
-        if self.layout != "xe2_dpas_native_v1" or self.format_version != FORMAT_VERSION:
+        if self.layout != "xe2_dpas_native_v1" or self.format_version not in _ROTATION_BY_VERSION:
             raise ValueError(f"hf_int4_g16: unsupported layout/version {self.layout}/{self.format_version}")
+        if (self.hadamard_block != HADAMARD_BLOCK
+                or self.rotation != _ROTATION_BY_VERSION[self.format_version]):
+            raise ValueError(
+                f"hf_int4_g16: unsupported rotation {self.rotation}/{self.hadamard_block} "
+                f"for {self.format_version}"
+            )
+        if self.moe_modules and self.format_version != FORMAT_VERSION_V2:
+            raise ValueError(f"hf_int4_g16: moe_modules require {FORMAT_VERSION_V2}")
+
+    def bind_architecture(self, hf_config) -> None:
+        """Record which vLLM name quirks the model's own config declares."""
+        if hf_config is None:
+            return
+        text = getattr(hf_config, "text_config", None) or hf_config
+        # GraniteMoeHybrid registers `self.mamba` but passes the prefix "...mixer".
+        self.mamba_registered_as_mixer = getattr(text, "model_type", None) == "granitemoehybrid"
+        layers = getattr(text, "num_hidden_layers", 0) or 0
+        first_kv_shared = layers - (getattr(text, "num_kv_shared_layers", 0) or 0)
+        # Mirrors vLLM's Gemma-4 weight mapper: declared full-attention layers
+        # ship no v_proj, and KV-shared layers drop their K/V tensors.
+        if getattr(text, "attention_k_eq_v", False) is True:
+            self.k_eq_v_layers = frozenset(
+                i for i, kind in enumerate(text.layer_types[:first_kv_shared]) if kind == "full_attention"
+            )
+        if getattr(text, "model_type", None) in ("gemma4", "gemma4_text"):
+            self.model_dropped_modules = frozenset(
+                f"layers.{i}.self_attn.{name}" for i in range(first_kv_shared, layers)
+                for name in ("k_proj", "v_proj")
+            )
+
+    def require_complete_coverage(self) -> None:
+        """processed == admitted, for dense and expert modules, before any forward."""
+        if not self.coverage.verified:
+            self.coverage.verify(set(self.quantized_modules) - self.model_dropped_modules, set(self.moe_modules))
+            logger.info("hf_int4_g16: coverage verified before the first forward: %d linear and %d expert "
+                        "modules processed", len(self.coverage.processed_linear), len(self.coverage.processed_moe))
 
     def _model_file(self, model_name, fname, revision):
         path = os.path.join(model_name, fname)
@@ -207,7 +307,7 @@ class HFInt4G16Config(QuantizationConfig):
         every packed key's dtype/shape is verified in the referenced
         safetensors header (an O(KB) read, with no tensor payload load).
         """
-        del hf_config
+        self.bind_architecture(hf_config)
         self.validate_format()
         idx_path = self._model_file(model_name, "model.safetensors.index.json", revision)
         qc_path = self._model_file(model_name, "quantization_config.json", revision)
@@ -232,8 +332,25 @@ class HFInt4G16Config(QuantizationConfig):
             stored[nk] = dict(v)
         if collisions:
             raise ValueError(f"hf_int4_g16: normalized manifest key collisions: {sorted(collisions)[:8]}")
+        moe_modules = parse_moe_manifest(q.get("moe_modules") or {}, _norm_key)
+        if moe_modules and self.format_version != FORMAT_VERSION_V2:
+            raise ValueError(f"hf_int4_g16: moe_modules require {FORMAT_VERSION_V2}")
 
         # Fail closed on sidecar format disagreement before any weights load.
+        for field in _INT_FIELDS:
+            if field in q:
+                _require_json_int(f"quantization_config {field}", q[field])
+        if self.format_version == FORMAT_VERSION_V2:
+            if q.get("had_block_rule") != HAD_BLOCK_RULE_V2:
+                raise ValueError(
+                    f"hf_int4_g16: {FORMAT_VERSION_V2} requires had_block_rule {HAD_BLOCK_RULE_V2!r}, "
+                    f"got {q.get('had_block_rule')!r}"
+                )
+            if "hadamard_block" in q:
+                raise ValueError(
+                    f"hf_int4_g16: {FORMAT_VERSION_V2} does not define a top-level hadamard_block "
+                    "(had_block_rule is the schedule)"
+                )
         for field, got, want in [
             ("group_size", q.get("group_size", self.group_size), self.group_size),
             ("hadamard_block", q.get("hadamard_block", self.hadamard_block), self.hadamard_block),
@@ -292,7 +409,7 @@ class HFInt4G16Config(QuantizationConfig):
                 if hname == "__metadata__":
                     continue
                 hbase, _ = _packed_base(hname)
-                if hbase is not None and wmap.get(hname) != shard:
+                if (hbase is not None or is_expert_packed_name(hname)) and wmap.get(hname) != shard:
                     unindexed_packed.append((hname, shard))
         if unindexed_packed:
             raise ValueError(
@@ -303,6 +420,8 @@ class HFInt4G16Config(QuantizationConfig):
         expert_packed = []
         norm_collisions = []
         for name, shard in wmap.items():
+            if is_expert_packed_name(name):
+                continue  # per-expert layout, admitted by admit_expert_tensors()
             base, suffix = _packed_base(name)
             if base is None:
                 continue
@@ -364,12 +483,13 @@ class HFInt4G16Config(QuantizationConfig):
             meta = dict(stored[base])
             shape = meta.get("shape")
             if (not isinstance(shape, (list, tuple)) or len(shape) != 2
-                    or not all(isinstance(v, int) and v > 0 for v in shape)):
+                    or not all(is_json_int(v) and v > 0 for v in shape)):
                 header_errors.append((base, "manifest shape must be two positive integers"))
                 continue
             declared_n, declared_k = int(shape[0]), int(shape[1])
-            if declared_k % HADAMARD_BLOCK:
-                header_errors.append((base, f"declared K={declared_k} is not a multiple of 128"))
+            block_error = self._module_block_error(meta, declared_k)
+            if block_error:
+                header_errors.append((base, block_error))
                 continue
             suffixes = packed[base]["suffixes"]
             entries = {}
@@ -420,6 +540,10 @@ class HFInt4G16Config(QuantizationConfig):
         missing = sorted(set(stored) - set(found))
         if missing:
             raise ValueError(f"hf_int4_g16: manifest modules missing q_pack tensors: {missing[:8]}")
+        actual_ks |= admit_expert_tensors(moe_modules, wmap, shard_headers, _norm_key)
+        full_precision_banks = FullPrecisionBanks(wmap, shard_headers, _norm_key)
+        if self.format_version == FORMAT_VERSION_V2 and sign_digests is None:
+            raise ValueError(f"hf_int4_g16: {FORMAT_VERSION_V2} requires sign_sha256_by_k")
 
         if sign_digests is not None:
             covered = {int(k) for k in sign_digests}
@@ -427,26 +551,78 @@ class HFInt4G16Config(QuantizationConfig):
             if missing_digest_ks:
                 raise ValueError(f"hf_int4_g16: sign_sha256_by_k missing digests for K={missing_digest_ks[:8]}")
 
-        if not found:
+        if not found and not moe_modules:
             raise ValueError("hf_int4_g16: checkpoint contains no complete quantized linear inventory")
         self.quantized_modules = found
+        self.moe_modules = moe_modules
+        self.full_precision_banks = full_precision_banks
+        if moe_modules:
+            logger.info("hf_int4_g16: %d packed MoE expert namespaces (%d with expert bias_corr)", len(moe_modules),
+                        sum(any(p.bias_corr for p in m.projections.values()) for m in moe_modules.values()))
         logger.info("hf_int4_g16: %d quantized linear modules (%d with bias_corr); biascorr_mode=%s mode=%s backend=%s",
                     len(found), sum(1 for v in found.values() if v.get("bias_corr")),
                     biascorr_mode(), linear_mode(), os.environ.get("HF_INT4_G16_BACKEND", "auto"))
 
-    def _members_for(self, prefix: str) -> list[str] | None:
-        parts = prefix.split(".")
-        if any(p in SKIP_PARTS for p in parts):
+    def _module_block_error(self, meta: dict[str, Any], k: int) -> str | None:
+        """Why a dense manifest entry's Hadamard block disagrees with its width, if it does."""
+        for field in ("had_block", "hadamard_block"):
+            if field in meta and not is_json_int(meta[field]):
+                return f"{field} must be a JSON integer, got {meta[field]!r}"
+        if self.format_version == FORMAT_VERSION:
+            if k % HADAMARD_BLOCK:
+                return f"declared K={k} is not a multiple of 128 ({FORMAT_VERSION} is Had128 only)"
+            declared = [meta[f] for f in ("had_block", "hadamard_block") if f in meta]
+            if any(v != HADAMARD_BLOCK for v in declared):
+                return f"had_block {declared} does not match {FORMAT_VERSION} Had128"
+            return None
+        if k % 64:
+            return f"declared K={k} is not a multiple of 128 (Had128) or 64 (Had64)"
+        if "hadamard_block" in meta:
+            return (f"legacy hadamard_block={meta['hadamard_block']} conflicts with the "
+                    f"{FORMAT_VERSION_V2} had_block field")
+        if meta.get("had_block") != had_block_for_k(k):
+            return f"had_block {meta.get('had_block')!r} does not match K={k} (expected {had_block_for_k(k)})"
+        return None
+
+    def _moe_namespace_for(self, prefix: str) -> str | None:
+        if not self.moe_modules or VISION_PARTS & set(prefix.split(".")):
             return None
         key = _norm_key(prefix)
-        if not self.quantized_modules:
+        # GraniteMoeHybrid names its RoutedExperts "...block_sparse_moe" while
+        # the checkpoint namespace is "...block_sparse_moe.experts".
+        return next((c for c in (key, f"{key}.experts") if c in self.moe_modules), None)
+
+    def _members_for(self, prefix: str) -> list[str] | None:
+        if VISION_PARTS & set(prefix.split(".")) or not self.quantized_modules:
             return None
-        base, _, leaf = key.rpartition(".")
-        members = FUSED.get(leaf, [leaf])
-        names = [f"{base}.{p}" if base else p for p in members]
-        present = [n in self.quantized_modules for n in names]
-        if not any(present):
+        key = _norm_key(prefix)
+        candidates = [key]
+        if self.mamba_registered_as_mixer and ".mixer." in key:
+            candidates.append(key.replace(".mixer.", ".mamba."))
+        matches = []
+        for candidate in candidates:
+            base, _, leaf = candidate.rpartition(".")
+            names = [f"{base}.{p}" if base else p for p in FUSED.get(leaf, [leaf])]
+            present = [n in self.quantized_modules for n in names]
+            if any(present):
+                matches.append((leaf, names, present))
+        if not matches:
             return None
+        if len(matches) > 1:
+            raise ValueError(
+                f"hf_int4_g16: ambiguous checkpoint names for {prefix}: both "
+                f"{[names for _, names, _ in matches]} are in the manifest"
+            )
+        [(leaf, names, present)] = matches
+        layer = re.search(r"(?:^|\.)layers\.(\d+)\.self_attn\.qkv_proj$", key)
+        if layer and int(layer[1]) in self.k_eq_v_layers:
+            # vLLM delivers k_proj twice here, as shard "k" and shard "v".
+            if present != [True, True, False]:
+                raise ValueError(
+                    f"hf_int4_g16: {prefix} is a declared attention_k_eq_v layer, so the manifest "
+                    f"must hold exactly q_proj and k_proj: {list(zip(names, present))}"
+                )
+            return [names[0], names[1], names[1]]
         if not all(present):
             raise ValueError(f"hf_int4_g16: partial fused quantization at {prefix}: {list(zip(names, present))}")
         return names
@@ -455,13 +631,42 @@ class HFInt4G16Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             members = self._members_for(prefix)
             if members is None:
-                return UnquantizedLinearMethod()
-            return HFInt4G16LinearMethod(self, members)
-        # FusedMoE in vLLM 0.31 is a RoutedExperts/MoERunner composition rather
-        # than a LinearBase.  HFInt4G16MoEMethod is intentionally not enabled
-        # until expert-weight checkpoint remapping is implemented; router gates
-        # and dense linears still use this method or exact bf16 fallback.
+                return _CoverageCheckedUnquantizedLinearMethod(self)
+            method = HFInt4G16LinearMethod(self, members)
+            self.coverage.claimed_linear.update(members)
+            return method
+        # FusedMoE in vLLM 0.31 is a MoERunner composition; the module that owns
+        # expert weights and asks for a method is its RoutedExperts child.
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+        if isinstance(layer, RoutedExperts):
+            namespace = self._moe_namespace_for(prefix)
+            if namespace is None:
+                self._require_full_precision_bank(layer.moe_config, prefix)
+                return None  # vLLM's unquantized method; packed keys for it would fail to load
+            module = self.moe_modules[namespace]
+            if not isinstance(module, MoEModule):
+                raise ValueError("hf_int4_g16: MoE manifest was not admitted by maybe_update_config()")
+            from .vllm_moe import HFInt4G16MoEMethod
+
+            method = HFInt4G16MoEMethod(
+                layer.moe_config, module, namespace, self.had_seed,
+                biascorr_mode(), linear_mode(), os.environ.get("HF_INT4_G16_BACKEND", "auto"), self,
+            )
+            self.coverage.claimed_moe.add(namespace)
+            return method
         return None
+
+    def _require_full_precision_bank(self, moe, prefix: str) -> None:
+        if self.full_precision_banks is None:
+            raise ValueError(
+                "hf_int4_g16: checkpoint metadata was not admitted by maybe_update_config(), so the "
+                f"weights of {prefix} cannot be verified"
+            )
+        self.full_precision_banks.require(
+            prefix, moe.num_experts, moe.hidden_dim_unpadded or moe.hidden_dim, moe.intermediate_size,
+            moe.is_act_and_mul,
+        )
 
 
 class HFInt4G16LinearMethod(LinearMethodBase):
@@ -481,13 +686,15 @@ class HFInt4G16LinearMethod(LinearMethodBase):
         del extra_weight_attrs
         k = int(input_size_per_partition)
         n = int(sum(output_partition_sizes))
-        if k % HADAMARD_BLOCK:
-            raise ValueError(f"hf_int4_g16: input partition K={k} is not a multiple of 128")
-        if input_size % HADAMARD_BLOCK:
-            raise ValueError(f"hf_int4_g16: global input K={input_size} is not a multiple of 128")
+        try:
+            block = had_block_for_k(int(input_size))
+        except ValueError as e:
+            raise ValueError(f"hf_int4_g16: global input {e}") from e
+        if k % block:
+            raise ValueError(
+                f"hf_int4_g16: input partition K={k} must align to the Had{block} blocks of global K={input_size}"
+            )
         tp_size = int(getattr(layer, "tp_size", 1))
-        if isinstance(layer, RowParallelLinear) and tp_size > 1 and input_size_per_partition % HADAMARD_BLOCK:
-            raise ValueError("hf_int4_g16: row-parallel input shards must align to Hadamard blocks")
 
         layer.hf_output_sizes = list(output_partition_sizes)
         layer.hf_offsets = [sum(output_partition_sizes[:i]) for i in range(len(output_partition_sizes) + 1)]
@@ -734,6 +941,7 @@ class HFInt4G16LinearMethod(LinearMethodBase):
                 raise ValueError(f"hf_int4_g16: duplicate load of {kind} member run {run_idx}")
 
             w = loaded_weight.detach().cpu() if loaded_weight.is_xpu else loaded_weight
+            check_payload(kind, w, f"{kind} member run {run_idx}")
             w = self._slice_input_if_row(layer, w, kind)
             member_width = expected_shape[-1] if kind in ("q_pack", "u_pack") else expected_shape[0]
             w = self._extract_output_slice(layer, w, run, kind, int(member_width))
@@ -804,8 +1012,10 @@ class HFInt4G16LinearMethod(LinearMethodBase):
         if layer.hf_has_bias_corr and layer.hf_biascorr_mode == "neg_zero":
             layer.bias_corr.data.fill_(-0.0)
         layer.hf_processed = True
+        self.config.coverage.processed_linear.update(self.members)
 
     def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None):
+        _require_complete_coverage(self.config)
         bc = None
         if layer.hf_has_bias_corr and layer.hf_biascorr_mode != "off":
             # RowParallelLinear output is reduced across ranks.  rank 0 alone owns

@@ -24,7 +24,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from .format import HAD_SEED, rotate_had128_noperm, signs_for_k
+from .format import HAD_SEED, rotate_had_noperm, signs_for_k
+
+KNOWN_LAYER_TYPES = {"full_attention", "linear_attention", "sliding_attention"}
 
 
 @dataclass
@@ -77,7 +79,57 @@ def _encode(tok, text: str) -> list[int]:
     return list(tok.encode(text, add_special_tokens=False))
 
 
-def load_mixed_train_calibration(tok, tokens_per_split: int = 1024) -> CalibrationData:
+# How many trailing content tokens a row may give up so all chat rows have one length.
+_CHAT_MAX_TRIM = 64
+
+
+def require_chat_template(tok) -> None:
+    if not getattr(tok, "chat_template", None):
+        raise ValueError("--cal-chat-template needs a tokenizer with a chat_template, and this one has none")
+
+
+def _chat_rows(tok, windows: list[list[int]]) -> tuple[list[list[int]], list[str]]:
+    """Render each text window as one user turn with a generation prompt.
+
+    Returns ``(rows, chunks)``.  The template writes its own special tokens, so
+    nothing is added on encode and a template BOS lands on position 0, which
+    calibration already excludes.  Calibration rows must be rectangular and the
+    re-encoded lengths can differ, so content is trimmed from the end (never the
+    template) to the longest length every window can reach.
+    """
+    require_chat_template(tok)
+    trims = _CHAT_MAX_TRIM + 1 if len(windows) > 1 else 1
+    options = []
+    for window in windows:
+        by_length: dict[int, tuple[list[int], str]] = {}
+        for trim in range(min(trims, len(window))):
+            chunk = tok.decode(window[:len(window) - trim], clean_up_tokenization_spaces=False)
+            text = tok.apply_chat_template(
+                [{"role": "user", "content": chunk}], tokenize=False, add_generation_prompt=True
+            )
+            ids = _encode(tok, text)
+            by_length.setdefault(len(ids), (ids, chunk))
+        options.append(by_length)
+    shared = set.intersection(*(set(by_length) for by_length in options))
+    if not shared:
+        raise ValueError(
+            f"--cal-chat-template cannot give all calibration rows one length within {_CHAT_MAX_TRIM} trimmed tokens"
+        )
+    length = max(shared)
+    return [o[length][0] for o in options], [o[length][1] for o in options]
+
+
+def _chat_info(tok, rows: list[list[int]], chunks: list[str]) -> dict[str, Any]:
+    return {
+        "cal_chat_template_sha256": hashlib.sha256(
+            json.dumps(tok.chat_template, sort_keys=True).encode()
+        ).hexdigest(),
+        "cal_row_tokens": len(rows[0]),
+        "cal_content_tokens": [len(_encode(tok, chunk)) for chunk in chunks],
+    }
+
+
+def load_mixed_train_calibration(tok, tokens_per_split: int = 1024, chat_template: bool = False) -> CalibrationData:
     """Load canonical WikiText-2 *train* + disjoint Python-stdlib calibration.
 
     The prose window is explicitly checked against the WikiText-2 test head and
@@ -133,6 +185,15 @@ def load_mixed_train_calibration(tok, tokens_per_split: int = 1024) -> Calibrati
         raise ValueError(f"calibration overlap invariant failed: wt2={wt_overlap}, difflib={code_overlap}")
 
     rows = [prose, code]
+    chat_info: dict[str, Any] = {}
+    if chat_template:
+        rows, chunks = _chat_rows(tok, rows)
+        # Template tokens are not corpus text; the invariant covers the content.
+        wt_overlap = _overlap_count(_encode(tok, chunks[0]), test_head, 6)
+        code_overlap = _overlap_count(_encode(tok, chunks[1]), diff_ids, 6)
+        if wt_overlap != 0 or code_overlap != 0:
+            raise ValueError(f"chat calibration overlap invariant failed: wt2={wt_overlap}, difflib={code_overlap}")
+        chat_info = _chat_info(tok, rows, chunks)
     sha = _sha_rows(rows)
     info = {
         "mode": "mixed_train",
@@ -145,6 +206,8 @@ def load_mixed_train_calibration(tok, tokens_per_split: int = 1024) -> Calibrati
         "wt2_test_head_6gram_overlap": wt_overlap,
         "difflib_py_6gram_overlap": code_overlap,
         "cal_token_sha256": sha,
+        "cal_chat_template": chat_template,
+        **chat_info,
     }
     return CalibrationData(rows, sha, info)
 
@@ -154,7 +217,7 @@ def sysconfig_path() -> str:  # never called; keeps the deterministic path expre
     return sysconfig.get_paths()["stdlib"]
 
 
-def load_corpus_calibration(tok, corpus_path: Path, max_tokens: int) -> CalibrationData:
+def load_corpus_calibration(tok, corpus_path: Path, max_tokens: int, chat_template: bool = False) -> CalibrationData:
     if corpus_path.suffix == ".parquet":
         import pyarrow.parquet as pq
         tbl = pq.read_table(corpus_path)
@@ -166,12 +229,18 @@ def load_corpus_calibration(tok, corpus_path: Path, max_tokens: int) -> Calibrat
     if len(ids) < 16:
         raise ValueError("bias-correction corpus produced fewer than 16 tokens")
     rows = [ids]
+    chat_info: dict[str, Any] = {}
+    if chat_template:
+        rows, chunks = _chat_rows(tok, rows)
+        chat_info = _chat_info(tok, rows, chunks)
     sha = _sha_rows(rows)
     return CalibrationData(rows, sha, {
         "mode": "corpus_file",
         "corpus_path": str(corpus_path),
-        "tokens": len(ids),
+        "tokens": len(rows[0]),
         "cal_token_sha256": sha,
+        "cal_chat_template": chat_template,
+        **chat_info,
     })
 
 
@@ -217,8 +286,7 @@ def _validate_raw_layer_types(payload: dict[str, Any]) -> None:
     layer_types = payload.get("layer_types")
     if layer_types is None:
         return
-    known = {"full_attention", "linear_attention"}
-    unknown = sorted(set(layer_types) - known)
+    unknown = sorted(set(layer_types) - KNOWN_LAYER_TYPES)
     if unknown:
         raise ValueError(f"streaming calibration unsupported layer_types: {unknown}")
 
@@ -232,6 +300,11 @@ def _pin_sdpa_attention(cfg) -> None:
         )
 
 
+def _is_tower_key(key: str) -> bool:
+    """Vision/audio encoders also have ``layers.N`` namespaces; never calibrate on them."""
+    return "vision" in key or "audio" in key
+
+
 def _load_architecture(model_dir: Path, wmap: dict[str, str]):
     """Return (text_config, LayerCls, base-module, source embedding key)."""
     from transformers import AutoConfig, AutoModelForCausalLM
@@ -240,11 +313,21 @@ def _load_architecture(model_dir: Path, wmap: dict[str, str]):
     _validate_raw_layer_types(raw.get("text_config") if isinstance(raw.get("text_config"), dict) else raw)
     arch = (raw.get("architectures") or [""])[0]
     if arch == "Qwen3_5ForConditionalGeneration" or isinstance(raw.get("text_config"), dict):
-        from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
-        cfg = Qwen3_5TextConfig(**raw["text_config"])
+        import transformers
+
+        text_type = raw["text_config"].get("model_type") or "qwen3_5_text"
+        wrapped = {
+            "qwen3_5_text": ("Qwen3_5TextConfig", "Qwen3_5ForCausalLM"),
+            "qwen3_5_moe_text": ("Qwen3_5MoeTextConfig", "Qwen3_5MoeForCausalLM"),
+            "gemma4_text": ("Gemma4TextConfig", "Gemma4ForCausalLM"),
+        }
+        if text_type not in wrapped:
+            raise ValueError(f"streaming calibration unsupported text model_type: {text_type}")
+        config_cls, model_cls = (getattr(transformers, name) for name in wrapped[text_type])
+        cfg = config_cls(**raw["text_config"])
         _pin_sdpa_attention(cfg)
         with torch.device("meta"):
-            dummy = Qwen3_5ForCausalLM(cfg)
+            dummy = model_cls(cfg)
     else:
         cfg = AutoConfig.from_pretrained(str(model_dir))
         _pin_sdpa_attention(cfg)
@@ -260,7 +343,7 @@ def _load_architecture(model_dir: Path, wmap: dict[str, str]):
     layer0 = base.layers[0]
     first_param = next(iter(layer0.state_dict().keys()))
     suffix = f"layers.0.{first_param}"
-    matches = sorted(k for k in wmap if k.endswith(suffix))
+    matches = sorted(k for k in wmap if k.endswith(suffix) and not _is_tower_key(k))
     if not matches:
         del dummy
         raise ValueError(f"cannot map first decoder-layer parameter {suffix} into checkpoint index")
@@ -284,7 +367,7 @@ def _load_architecture(model_dir: Path, wmap: dict[str, str]):
     return cfg, layer_cls, base, emb_key, layer0_src_prefix, dummy
 
 
-def _forward_kwargs(layer: nn.Module, pos_emb, mask, pos_ids) -> dict[str, Any]:
+def _forward_kwargs(layer: nn.Module, pos_emb, mask, pos_ids, shared_kv_states: dict) -> dict[str, Any]:
     sig = inspect.signature(layer.forward)
     kw: dict[str, Any] = {}
     if "position_embeddings" in sig.parameters:
@@ -295,7 +378,41 @@ def _forward_kwargs(layer: nn.Module, pos_emb, mask, pos_ids) -> dict[str, Any]:
         kw["position_ids"] = pos_ids
     if "use_cache" in sig.parameters:
         kw["use_cache"] = False
+    if "shared_kv_states" in sig.parameters:
+        kw["shared_kv_states"] = shared_kv_states
     return kw
+
+
+def _expert_stats_hook(stats: dict[str, torch.Tensor], batch: int, seq: int):
+    """Routed pos0-excluded means for one ``*Experts`` module.
+
+    ``mean_x[e]`` averages the hidden states routed to expert ``e``;
+    ``mean_down[e]`` averages ``act(gate) * up`` from the original weights over
+    the same tokens.  An expert with no routed token keeps zero means and a zero
+    count, and the converter writes a zero correction for it.
+    """
+    def hook(module, args, kwargs):
+        bound = inspect.signature(module.forward).bind(*args, **kwargs).arguments
+        hidden, top_k_index = bound["hidden_states"], bound["top_k_index"]
+        if hidden.ndim != 2 or hidden.shape[0] != batch * seq:
+            raise RuntimeError(
+                f"routed experts received {tuple(hidden.shape)}, expected [{batch * seq},H]; "
+                "cannot exclude position zero"
+            )
+        gate_up_w, num_experts = module.gate_up_proj, module.gate_up_proj.shape[0]
+        routed = torch.zeros((hidden.shape[0], num_experts), device=hidden.device)
+        routed.scatter_(1, top_k_index.reshape(hidden.shape[0], -1), 1.0)
+        routed[torch.arange(hidden.shape[0], device=hidden.device) % seq == 0] = 0.0
+        counts = routed.sum(dim=0)
+        mean_x = (routed.t() @ hidden.float()) / counts.clamp(min=1)[:, None]
+        mean_down = torch.zeros((num_experts, gate_up_w.shape[1] // 2), device=hidden.device)
+        for expert in torch.nonzero(counts)[:, 0].tolist():
+            selected = torch.nonzero(routed[:, expert])[:, 0]
+            gate, up = F.linear(hidden[selected], gate_up_w[expert]).chunk(2, dim=-1)
+            mean_down[expert] = (module.act_fn(gate) * up).float().sum(dim=0) / counts[expert]
+        stats.update(counts=counts.long().cpu(), mean_x=mean_x.cpu(), mean_down=mean_down.cpu())
+
+    return hook
 
 
 @torch.no_grad()
@@ -306,12 +423,19 @@ def stream_calibration_means(
     device: str | torch.device,
     seed: int = HAD_SEED,
     return_hidden: bool = False,
+    expert_sources: list | None = None,
+    expert_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ):
     """Stream the decoder and return pos0-excluded per-linear activation means.
 
     Returns ``means[full_checkpoint_linear_prefix] = {'mean_x', 'mean_rx'}`` as
     CPU FP32 tensors.  The only full-model state carried across layers is the
     small calibration hidden activation and these mean vectors.
+
+    ``expert_sources`` (from ``experts_source.scan_experts``) lets MoE decoder
+    layers be materialized from any supported expert layout.  When
+    ``expert_stats`` is a dict, it is filled with routed means keyed by each
+    source namespace (see ``_expert_stats_hook``).
     """
     model_dir = Path(model_dir)
     dev = torch.device(device)
@@ -326,13 +450,16 @@ def stream_calibration_means(
     cfg, layer_cls, base, emb_key, layer0_prefix, dummy = _load_architecture(model_dir, wmap)
     rotary_cls = type(base.rotary_emb) if hasattr(base, "rotary_emb") else None
     qmod = inspect.getmodule(type(base))
-    layer_types = list(getattr(cfg, "layer_types", ["full_attention"] * int(cfg.num_hidden_layers)))
-    known_layer_types = {"full_attention", "linear_attention"}
-    unknown_layer_types = sorted(set(layer_types) - known_layer_types)
+    layer_types = list(getattr(cfg, "layer_types", None) or ["full_attention"] * int(cfg.num_hidden_layers))
+    unknown_layer_types = sorted(set(layer_types) - KNOWN_LAYER_TYPES)
     if unknown_layer_types:
         raise ValueError(f"streaming calibration unsupported layer_types: {unknown_layer_types}")
     if len(layer_types) < int(cfg.num_hidden_layers):
         raise ValueError("streaming calibration layer_types shorter than num_hidden_layers")
+    if getattr(cfg, "hidden_size_per_layer_input", None):
+        raise ValueError("streaming calibration does not support per-layer input embeddings")
+    # Gemma-family embeddings are scaled by sqrt(H), rounded in the weight dtype.
+    embed_scale = getattr(getattr(base, "embed_tokens", None), "scalar_embed_scale", None)
     del base, dummy
     gc.collect()
 
@@ -343,6 +470,8 @@ def stream_calibration_means(
 
     emb = reader.get(emb_key).to(device=dev, dtype=torch.bfloat16)
     hidden = F.embedding(rows, emb)
+    if embed_scale is not None:
+        hidden = hidden * torch.tensor(embed_scale, device=dev).to(hidden.dtype)
     del emb
     _empty_cache(dev)
 
@@ -358,7 +487,11 @@ def stream_calibration_means(
     pos_emb = None
     if rotary_cls is not None:
         rotary = rotary_cls(config=cfg, device=dev)
-        pos_emb = rotary(hidden, rotary_pos_ids)
+        if "layer_type" in inspect.signature(rotary.forward).parameters:
+            # Separate local/global RoPE per attention type (Gemma family).
+            pos_emb = {lt: rotary(hidden, rotary_pos_ids, lt) for lt in sorted(set(layer_types))}
+        else:
+            pos_emb = rotary(hidden, rotary_pos_ids)
         del rotary
 
     mask_kwargs = {"config": cfg, "inputs_embeds": hidden, "attention_mask": None,
@@ -372,9 +505,18 @@ def stream_calibration_means(
         masks["linear_attention"] = qmod.create_recurrent_attention_mask(**mask_kwargs)
     else:
         masks["linear_attention"] = masks["full_attention"]
+    if "sliding_attention" in layer_types:
+        if not hasattr(qmod, "create_sliding_window_causal_mask"):
+            raise ValueError("streaming calibration cannot build a sliding_attention mask for this model")
+        masks["sliding_attention"] = qmod.create_sliding_window_causal_mask(**mask_kwargs)
 
     means: dict[str, dict[str, torch.Tensor]] = {}
     linears_seen = 0
+    shared_kv_states: dict = {}
+    experts_by_name: dict[str, tuple[Any, str]] = {}
+    for source in expert_sources or []:
+        for fused_name in ("gate_up_proj", "down_proj"):
+            experts_by_name[f"{source.namespace}.{fused_name}"] = (source, fused_name)
     sign_cache: dict[int, torch.Tensor] = {}
 
     for lidx in range(int(cfg.num_hidden_layers)):
@@ -386,11 +528,23 @@ def stream_calibration_means(
             raise ValueError(f"decoder layer {lidx} has no loadable state")
         first = state_names[0]
         suffix = f"layers.{lidx}.{first}"
-        matches = sorted(k for k in wmap if k.endswith(suffix))
+        matches = sorted(k for k in wmap if k.endswith(suffix) and not _is_tower_key(k))
         if not matches:
             raise ValueError(f"cannot map decoder layer {lidx} parameter {suffix}")
         src_prefix = matches[0][: -len(first)]
-        sd = {pname: reader.get(src_prefix + pname) for pname in state_names}
+
+        def read(key, index=None):
+            tensor = reader.get(key)
+            return tensor if index is None else tensor[index]
+
+        def load_state(pname):
+            key = src_prefix + pname
+            if key not in wmap and key in experts_by_name:
+                source, fused_name = experts_by_name[key]
+                return source.read_fused(read, fused_name)
+            return reader.get(key)
+
+        sd = {pname: load_state(pname) for pname in state_names}
         layer.load_state_dict(sd, strict=True)
         del sd
         layer = layer.to(device=dev, dtype=torch.bfloat16).eval()
@@ -404,6 +558,8 @@ def stream_calibration_means(
                 if not inp or not torch.is_tensor(inp[0]):
                     return
                 x = inp[0].detach()
+                if x.ndim == 2 and x.shape[0] == B * S:
+                    x = x.reshape(B, S, x.shape[1])  # MoE routers flatten [B,S,H]
                 if x.ndim == 3:
                     x = x[:, 1:, :] if x.shape[1] > 1 else x[:, :0, :]
                 elif x.ndim == 2:
@@ -418,7 +574,7 @@ def stream_calibration_means(
                 xf = x.float()
                 if k not in sign_cache:
                     sign_cache[k] = signs_for_k(k, seed, dev)
-                xr = rotate_had128_noperm(xf, sign_cache[k])
+                xr = rotate_had_noperm(xf, sign_cache[k])
                 ent = stats.setdefault(nm, {
                     "sum_x": torch.zeros(k, device=dev, dtype=torch.float32),
                     "sum_rx": torch.zeros(k, device=dev, dtype=torch.float32),
@@ -430,11 +586,23 @@ def stream_calibration_means(
             return hook
 
         for n, m in linears:
-            hooks.append(m.register_forward_pre_hook(make_hook(n, m.in_features)))
+            # A width off the 64 grid has no rotation and is never quantized,
+            # for example inside an expert bank that stays in BF16.
+            if m.in_features % 64 == 0:
+                hooks.append(m.register_forward_pre_hook(make_hook(n, m.in_features)))
+        layer_expert_stats: dict[str, dict[str, torch.Tensor]] = {}
+        if expert_stats is not None:
+            for n, m in layer.named_modules():
+                if type(m).__name__.endswith("Experts") and hasattr(m, "gate_up_proj"):
+                    layer_expert_stats[n] = {}
+                    hooks.append(m.register_forward_pre_hook(
+                        _expert_stats_hook(layer_expert_stats[n], B, S), with_kwargs=True
+                    ))
 
         ltype = layer_types[lidx] if lidx < len(layer_types) else "full_attention"
         mask = masks.get(ltype, masks["full_attention"])
-        out = layer(hidden, **_forward_kwargs(layer, pos_emb, mask, pos_ids))
+        layer_pos_emb = pos_emb[ltype] if isinstance(pos_emb, dict) else pos_emb
+        out = layer(hidden, **_forward_kwargs(layer, layer_pos_emb, mask, pos_ids, shared_kv_states))
         hidden = out[0] if isinstance(out, tuple) else out
         for h in hooks:
             h.remove()
@@ -449,6 +617,11 @@ def stream_calibration_means(
                 "mean_rx": (ent["sum_rx"] / c).detach().cpu().float(),
             }
             linears_seen += 1
+
+        for n, captured in layer_expert_stats.items():
+            if not captured:
+                raise ValueError(f"routed experts {lidx}.{n} were never called during calibration")
+            expert_stats[src_prefix + n] = captured
 
         del layer, linears, stats, hooks, out
         if lidx % 4 == 3 or lidx == int(cfg.num_hidden_layers) - 1:

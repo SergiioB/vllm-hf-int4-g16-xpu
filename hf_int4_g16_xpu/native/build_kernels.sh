@@ -37,7 +37,14 @@ except Exception as e:
     raise SystemExit(f'readelf .ze_info failed: {e}')
 names = set(re.findall(r'- name:\s+([A-Za-z0-9_]+)', txt))
 expected = {
-    'fused_fwht128_actq', 'reduce_gsk2_epilogue',
+    'fused_fwht128_actq', 'fused_fwht64_actq', 'reduce_gsk2_epilogue',
+    'hf_decode_fused_had64_m1', 'hf_decode_fused_had64_m2', 'hf_decode_fused_had64_m4',
+    'hf_moe_pair_had128_bf16', 'hf_moe_pair_had128_f32',
+    'hf_moe_pair_had64_bf16', 'hf_moe_pair_had64_f32',
+    'hf_moe_bucket_zero', 'hf_moe_bucket_count', 'hf_moe_bucket_scan', 'hf_moe_bucket_scatter',
+    'hf_moe_rotate_had128', 'hf_moe_rotate_had64',
+    'hf_moe_tile_had128_bf16', 'hf_moe_tile_had128_f32',
+    'hf_moe_tile_had64_bf16', 'hf_moe_tile_had64_f32',
     'hf_dpas_m8_sk4', 'hf_dpas_m16_sk4', 'hf_dpas_m32_sk4',
     'hf_dpas_m32_n16', 'hf_dpas_m64_n16', 'hf_dpas_m64_n16_wg16',
     'hf_dpas_m128_n16', 'hf_dpas_m128_n16_wg8', 'hf_dpas_m128_n16_wg8_p1',

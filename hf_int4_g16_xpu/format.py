@@ -14,10 +14,21 @@ Canonical production layout (Xe2 DPAS native, little-endian):
   ``D[n] * (q[n,k] * u[n,k//16])``.
 * ``bias_corr``: optional fp32 ``[N]``, added once in the fp32 epilogue.
 
-Rotation: contiguous non-permuted block-128 Sylvester Hadamard.  Both weights
-and activations are transformed as ``z = (x * signs) @ H128`` where signs are
-generated on CPU with torch generator seed ``had_seed * 100003 + K`` and
-values in {-1,+1}.  The converter reference and this loader use seed 101.
+Rotation: contiguous non-permuted blockwise Sylvester Hadamard.  Both weights
+and activations are transformed as ``z = (x * signs) @ H_B`` per block, where
+signs are generated on CPU with torch generator seed ``had_seed * 100003 + K``
+and values in {-1,+1}.  The converter reference and this loader use seed 101.
+
+The block size ``B`` is a pure function of the projection's global ``K``
+(:func:`had_block_for_k`): 128 when ``K % 128 == 0``, else 64 when
+``K % 64 == 0`` (every block of that projection is 64 wide), else the
+projection is not representable.  The packed containers are the same for both,
+because ``u_pack`` already groups 64 positions per word.
+
+Format versions: ``hf_int4_g16/1`` holds dense Had128 modules only.
+``hf_int4_g16/2`` is required as soon as a checkpoint holds a Had64 projection
+or packed MoE experts.  Expert tensors keep this bit layout but use the names
+in :data:`EXPERT_TENSOR_SUFFIXES`.
 
 Disk-contract note: ``xe2_dpas_native_v1`` is a distinct Xe2-native contract,
 not a portable GPTQ/AWQ-style adjacent-nibble interchange format.  Loaders
@@ -28,27 +39,77 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any
 
 import torch
 
 FORMAT_VERSION = "hf_int4_g16/1"
+FORMAT_VERSION_V2 = "hf_int4_g16/2"
+ROTATION_V1 = "Had128NoPerm"
+ROTATION_V2 = "HadAutoNoPerm"
+# The only block schedule hf_int4_g16/2 defines.  A different schedule (for
+# example Had128 blocks plus a Had64 tail) needs a new format version.
+HAD_BLOCK_RULE_V2 = "per projection: 128 if K % 128 == 0 else 64"
 GROUP_SIZE = 16
 HADAMARD_BLOCK = 128
+HADAMARD_BLOCK_SMALL = 64
 HAD_SEED = 101
+
+# MoE expert tensors: logical packed role -> on-disk suffix.  vLLM derives the
+# RoutedExperts parameter name from the suffix ("w13_" / "w2_" + suffix), and its
+# GraniteMoeHybrid loader only finds names that match its fixed expert suffix
+# list (".w13_qweight", ".w13_scale", ".w13_bias", ...).  The row scale is
+# therefore "scale_super": "super_scales" would not be remapped.
+EXPERT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+EXPERT_TENSOR_SUFFIXES = {
+    "q_pack": "qweight",
+    "u_pack": "scales",
+    "d_row": "scale_super",
+    "bias_corr": "bias_corr",
+}
+
+
+def is_json_int(value) -> bool:
+    """A JSON integer.  ``16.0`` and ``true`` compare equal to ints but are not."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def had_block_for_k(k: int) -> int:
+    """Hadamard block size of a projection with global input width ``k``."""
+    k = int(k)
+    if k > 0 and k % HADAMARD_BLOCK == 0:
+        return HADAMARD_BLOCK
+    if k > 0 and k % HADAMARD_BLOCK_SMALL == 0:
+        return HADAMARD_BLOCK_SMALL
+    raise ValueError(f"K must be a multiple of 128 (Had128) or of 64 (Had64); got K={k}")
+
+
+def check_payload(role: str, tensor: torch.Tensor, what: str) -> None:
+    """Value checks that header-only admission cannot make."""
+    if role not in ("d_row", "bias_corr"):
+        return
+    if not torch.isfinite(tensor).all():
+        raise ValueError(f"hf_int4_g16: {what} contains NaN or Inf")
+    if role == "d_row" and not (tensor > 0).all():
+        raise ValueError(f"hf_int4_g16: {what} row scales must be positive")
+
+
+def make_hadamard(block: int, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Orthonormal Sylvester Hadamard matrix of size ``block`` (64 or 128)."""
+    if block not in (HADAMARD_BLOCK_SMALL, HADAMARD_BLOCK):
+        raise ValueError(f"unsupported Hadamard block {block}")
+    h = torch.tensor([[1.0]], device=device, dtype=dtype)
+    while h.shape[0] < block:
+        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+    return h / math.sqrt(float(block))
 
 
 def make_had128(device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    h = torch.tensor([[1.0]], device=device, dtype=dtype)
-    for _ in range(7):
-        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
-    return h / math.sqrt(128.0)
+    return make_hadamard(HADAMARD_BLOCK, device, dtype)
 
 
 def signs_for_k(k: int, seed: int = HAD_SEED, device: torch.device | str = "cpu") -> torch.Tensor:
     """Deterministic sign vector.  The exact seed arithmetic is part of the format."""
-    if k % HADAMARD_BLOCK:
-        raise ValueError(f"K must be a multiple of 128, got {k}")
+    had_block_for_k(k)
     g = torch.Generator(device="cpu").manual_seed(int(seed) * 100003 + int(k))
     return (torch.randint(0, 2, (int(k),), generator=g) * 2 - 1).to(device=device, dtype=torch.int8)
 
@@ -60,20 +121,27 @@ def sign_sha256_for_k(k: int, seed: int = HAD_SEED) -> str:
     return hashlib.sha256(signs_for_k(k, seed, "cpu").numpy().tobytes()).hexdigest()
 
 
-def rotate_had128_noperm(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
-    """Apply the canonical rotation to a tensor whose last dimension is K."""
+def rotate_had_noperm(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    """Apply the canonical rotation to a tensor whose last dimension is the global K."""
     if x.shape[-1] != signs.numel():
         raise ValueError(f"K mismatch: x {tuple(x.shape)} signs {tuple(signs.shape)}")
-    h = make_had128(x.device, torch.float32)
+    block = had_block_for_k(x.shape[-1])
+    h = make_hadamard(block, x.device, torch.float32)
     xs = x.float() * signs.to(device=x.device, dtype=torch.float32)
-    return (xs.reshape(-1, HADAMARD_BLOCK) @ h).reshape(xs.shape)
+    return (xs.reshape(-1, block) @ h).reshape(xs.shape)
+
+
+def rotate_had128_noperm(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    """:func:`rotate_had_noperm` restricted to Had128 geometry."""
+    if x.shape[-1] % HADAMARD_BLOCK:
+        raise ValueError(f"Had128 rotation needs K a multiple of 128, got {x.shape[-1]}")
+    return rotate_had_noperm(x, signs)
 
 
 def _q_u_from_logical(w_rot: torch.Tensor, ratios=(0.76, 0.82, 0.88, 0.94, 1.00, 1.06), chunk_n: int | None = None):
     """Progressive G16 quantizer exactly matching the exp8b reference."""
     n, k = w_rot.shape
-    if k % HADAMARD_BLOCK:
-        raise ValueError(f"K must be a multiple of 128, got {k}")
+    had_block_for_k(k)
     ng = k // GROUP_SIZE
     wg = w_rot.reshape(n, ng, GROUP_SIZE)
     row_amax = wg.abs().amax(dim=(1, 2)).clamp(min=1e-12)
@@ -116,8 +184,7 @@ def pack_native_words(q_plus8: torch.Tensor, u_minus1: torch.Tensor) -> tuple[to
     final bit-container cast, making the little-endian bit layout explicit.
     """
     n, k = q_plus8.shape
-    if k % HADAMARD_BLOCK:
-        raise ValueError(f"K must be a multiple of 128, got {k}")
+    had_block_for_k(k)
     qcpu = q_plus8.detach().cpu().numpy().astype("uint32", copy=False)
     ucpu = u_minus1.detach().cpu().numpy().astype("uint32", copy=False)
     import numpy as np
@@ -155,12 +222,11 @@ def quantize_pack_hf_int4(
     if weight.ndim != 2:
         raise ValueError(f"weight must be rank-2 [N,K], got {tuple(weight.shape)}")
     n, k = weight.shape
-    if k % HADAMARD_BLOCK:
-        raise ValueError(f"K must be a multiple of 128, got {k}")
+    had_block_for_k(k)
     dev = torch.device(device) if device is not None else weight.device
     w = weight.to(device=dev, dtype=torch.float32)
     signs = signs_for_k(k, seed, dev).float()
-    wr = rotate_had128_noperm(w, signs)
+    wr = rotate_had_noperm(w, signs)
     q, u, d = _q_u_from_logical(wr, ratios=ratios)
     qp, up = pack_native_words(q, u)
     return {"q_pack": qp, "u_pack": up, "d_row": d.detach().cpu().float().contiguous()}
@@ -188,7 +254,3 @@ def unpack_hf_int4_reference(q_pack: torch.Tensor, u_pack: torch.Tensor) -> torc
     ushifts = (((rows // 16) % 4) * 4).to(q_pack.device)
     u = ((u16 >> ushifts) & 0xF).to(torch.int16) + 1
     return (q * u).to(torch.int8)
-
-
-def tensor_bitsummary(t: torch.Tensor) -> dict[str, Any]:
-    return {"shape": list(t.shape), "dtype": str(t.dtype), "sha256": None}
